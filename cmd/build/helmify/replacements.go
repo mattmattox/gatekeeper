@@ -37,6 +37,10 @@ var replacements = map[string]string{
 
 	"HELMSUBST_VALIDATING_WEBHOOK_TIMEOUT": `{{ .Values.validatingWebhookTimeoutSeconds }}`,
 
+	"HELMSUBST_VALIDATING_WEBHOOK_FAILURE_POLICY": `{{ .Values.validatingWebhookFailurePolicy }}`,
+
+	"HELMSUBST_VALIDATING_WEBHOOK_CHECK_IGNORE_FAILURE_POLICY": `{{ .Values.validatingWebhookCheckIgnoreFailurePolicy }}`,
+
 	"HELMSUBST_RESOURCEQUOTA_POD_LIMIT": `{{ .Values.podCountLimit }}`,
 
 	"HELMSUBST_VALIDATING_WEBHOOK_OPERATION_RULES": `
@@ -57,5 +61,9 @@ var replacements = map[string]string{
 	"- HELMSUBST_DEPLOYMENT_CONTROLLER_MANAGER_DISABLED_BUILTIN": `
         {{- range .Values.disabledBuiltins}}
         - --disable-opa-builtin={{ . }}
+        {{- end }}`,
+	"- HELMSUBST_DEPLOYMENT_CONTROLLER_MANAGER_EXEMPT_NAMESPACES": `
+        {{- range .Values.controllerManager.exemptNamespaces}}
+        - --exempt-namespace={{ . }}
         {{- end }}`,
 }

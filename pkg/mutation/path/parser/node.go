@@ -23,8 +23,6 @@ import (
 type NodeType string
 
 const (
-	// PathNode is a string segment of a path.
-	PathNode NodeType = "Path"
 	// ListNode is an array element of a path.
 	ListNode NodeType = "List"
 	// ObjectNode is the final Node in a path, what is being referenced.
@@ -40,20 +38,9 @@ type Node interface {
 	String() string
 }
 
-// Path represents an entire parsed path specification
+// Path represents an entire parsed path specification.
 type Path struct {
 	Nodes []Node
-}
-
-var _ Node = Path{}
-
-func (r Path) Type() NodeType {
-	return PathNode
-}
-
-func (r Path) DeepCopyNode() Node {
-	rout := r.DeepCopy()
-	return &rout
 }
 
 func (r Path) DeepCopy() Path {
@@ -106,7 +93,7 @@ func (o Object) String() string {
 
 type List struct {
 	KeyField string
-	KeyValue *string
+	KeyValue interface{}
 	Glob     bool
 }
 
@@ -125,18 +112,9 @@ func (l List) DeepCopy() List {
 	out := List{}
 	out.KeyField = l.KeyField
 	out.Glob = l.Glob
-	if l.KeyValue != nil {
-		out.KeyValue = new(string)
-		*out.KeyValue = *l.KeyValue
-	}
+	// KeyValue (interface{}) will be one of: [string, int, nil]
+	out.KeyValue = l.KeyValue
 	return out
-}
-
-func (l List) Value() (string, bool) {
-	if l.KeyValue == nil {
-		return "", false
-	}
-	return *l.KeyValue, true
 }
 
 func (l List) String() string {
@@ -144,19 +122,40 @@ func (l List) String() string {
 	if l.Glob {
 		return fmt.Sprintf("[%s: *]", key)
 	}
-	if l.KeyValue != nil {
-		value := quote(*l.KeyValue)
-		return fmt.Sprintf("[%s: %s]", key, value)
+	switch v := l.KeyValue.(type) {
+	case string:
+		q := quote(v)
+		return fmt.Sprintf("[%s: %s]", key, q)
+
+	case int, int64:
+		return fmt.Sprintf("[%s: %d]", key, v)
+
+	case nil:
+	default:
 	}
 	// Represents an improperly specified List node.
 	return fmt.Sprintf("[%s: ]", key)
 }
 
-// quote adds double quotes around the passed string.
+// quote optionally adds double quotes around the passed string if needed.
+// Quotes are needed for:
+//  * Strings containing whitespace, quotes, or other "ambiguous" characters that will
+//    be tokenized as non-strings and need escaping.
+//  * Strings starting digits, that would otherwise be tokenized as an integer
+//  * Empty strings
 func quote(s string) string {
-	// Using fmt.Sprintf with %q converts whitespace to escape sequences, and we
-	// don't want that.
-	s = strings.ReplaceAll(s, `\`, `\\`)
-	s = strings.ReplaceAll(s, `"`, `\"`)
-	return `"` + s + `"`
+	if len(s) == 0 {
+		return `""`
+	}
+	switch {
+	case strings.ContainsAny(s, "'\"\t\n \\*[]:."),
+		strings.ContainsAny(s[0:1], "0123456789"):
+		// Using fmt.Sprintf with %q converts whitespace to escape sequences, and we
+		// don't want that.
+		s = strings.ReplaceAll(s, `\`, `\\`)
+		s = strings.ReplaceAll(s, `"`, `\"`)
+		return `"` + s + `"`
+	}
+
+	return s
 }

@@ -15,7 +15,7 @@ import (
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 var (
@@ -42,14 +42,15 @@ var (
 // AssignMeta instance.
 type AssignMetadataMutator struct {
 	id             types.ID
+	tester         *tester.Tester
 	assignMetadata *mutationsv1alpha1.AssignMetadata
 	path           parser.Path
 }
 
-// assignMetadataMutator implements mutator
+// assignMetadataMutator implements mutator.
 var _ types.Mutator = &AssignMetadataMutator{}
 
-func (m *AssignMetadataMutator) Matches(obj runtime.Object, ns *corev1.Namespace) bool {
+func (m *AssignMetadataMutator) Matches(obj client.Object, ns *corev1.Namespace) bool {
 	matches, err := match.Matches(&m.assignMetadata.Spec.Match, obj, ns)
 	if err != nil {
 		log.Error(err, "AssignMetadataMutator.Matches failed", "assignMeta", m.assignMetadata.Name)
@@ -59,14 +60,9 @@ func (m *AssignMetadataMutator) Matches(obj runtime.Object, ns *corev1.Namespace
 }
 
 func (m *AssignMetadataMutator) Mutate(obj *unstructured.Unstructured) (bool, error) {
-	t, err := tester.New(m.Path(), []tester.Test{
-		{SubPath: m.Path(), Condition: tester.MustNotExist},
-	})
-	if err != nil {
-		return false, err
-	}
-	return core.Mutate(m, t, nil, obj)
+	return core.Mutate(m, m.tester, nil, obj)
 }
+
 func (m *AssignMetadataMutator) ID() types.ID {
 	return m.id
 }
@@ -95,6 +91,7 @@ func (m *AssignMetadataMutator) HasDiff(mutator types.Mutator) bool {
 func (m *AssignMetadataMutator) DeepCopy() types.Mutator {
 	res := &AssignMetadataMutator{
 		id:             m.id,
+		tester:         m.tester.DeepCopy(),
 		assignMetadata: m.assignMetadata.DeepCopy(),
 		path:           m.path.DeepCopy(),
 	}
@@ -141,21 +138,28 @@ func MutatorForAssignMetadata(assignMeta *mutationsv1alpha1.AssignMetadata) (*As
 		return nil, errors.New("spec.parameters.assign.value field must be a string for AssignMetadata " + assignMeta.GetName())
 	}
 
+	t, err := tester.New(path, []tester.Test{
+		{SubPath: path, Condition: tester.MustNotExist},
+	})
+	if err != nil {
+		return nil, err
+	}
+
 	return &AssignMetadataMutator{
 		id:             types.MakeID(assignMeta),
+		tester:         t,
 		assignMetadata: assignMeta.DeepCopy(),
 		path:           path,
 	}, nil
 }
 
-// Verifies that the given path is valid for metadata
+// Verifies that the given path is valid for metadata.
 func isValidMetadataPath(path parser.Path) bool {
 	// Path must be metadata.annotations.something or metadata.labels.something
 	if len(path.Nodes) != 3 ||
 		path.Nodes[0].Type() != parser.ObjectNode ||
 		path.Nodes[1].Type() != parser.ObjectNode ||
 		path.Nodes[2].Type() != parser.ObjectNode {
-
 		return false
 	}
 
@@ -169,7 +173,7 @@ func isValidMetadataPath(path parser.Path) bool {
 }
 
 // IsValidAssignMetadata returns an error if the given assignmetadata object is not
-// semantically valid
+// semantically valid.
 func IsValidAssignMetadata(assignMeta *mutationsv1alpha1.AssignMetadata) error {
 	if _, err := MutatorForAssignMetadata(assignMeta); err != nil {
 		return err

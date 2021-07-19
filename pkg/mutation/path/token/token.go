@@ -22,6 +22,7 @@ const (
 	ERROR     = "ERROR"
 	EOF       = "EOF"
 	IDENT     = "IDENT"
+	INT       = "INT"
 	LBRACKET  = "LBRACKET"
 	RBRACKET  = "RBRACKET"
 	SEPARATOR = "SEPARATOR"
@@ -29,11 +30,13 @@ const (
 	COLON     = "COLON"
 )
 
-type Type string
-type Token struct {
-	Type    Type
-	Literal string
-}
+type (
+	Type  string
+	Token struct {
+		Type    Type
+		Literal string
+	}
+)
 
 func (t Token) String() string {
 	return fmt.Sprintf("%s: %q", t.Type, t.Literal)
