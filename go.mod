@@ -10,7 +10,7 @@ require (
 	github.com/go-logr/logr v0.4.0
 	github.com/go-logr/zapr v0.2.0
 	github.com/go-openapi/spec v0.20.3 // indirect
-	github.com/google/go-cmp v0.5.4
+	github.com/google/go-cmp v0.5.5
 	github.com/google/uuid v1.1.2
 	github.com/mitchellh/mapstructure v1.4.1 // indirect
 	github.com/onsi/ginkgo v1.15.0
@@ -19,7 +19,7 @@ require (
 	github.com/open-policy-agent/frameworks/constraint v0.0.0-20210522003146-5c034948ac29
 	github.com/open-policy-agent/opa v0.29.4
 	github.com/pkg/errors v0.9.1
-	github.com/prometheus/client_golang v1.7.1
+	github.com/prometheus/client_golang v1.11.1
 	github.com/spf13/cobra v1.1.3
 	go.opencensus.io v0.22.4
 	go.uber.org/zap v1.15.0
