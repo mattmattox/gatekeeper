@@ -2,20 +2,14 @@ package metrics
 
 import (
 	"context"
-	"flag"
-	"fmt"
-	"strings"
 
-	"go.opencensus.io/stats/view"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/metrics/exporters/common"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/metrics/registry"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 )
 
-var (
-	metricsBackend = flag.String("metrics-backend", "Prometheus", "Backend used for metrics")
-	prometheusPort = flag.Int("prometheus-port", 8888, "Prometheus port for metrics backend")
-)
-
-const prometheusExporter = "prometheus"
+var log = logf.Log.WithName("metrics")
 
 var _ manager.Runnable = &runner{}
 
@@ -24,69 +18,39 @@ type runner struct {
 }
 
 func AddToManager(m manager.Manager) error {
-	mr, err := new(m)
-	if err != nil {
-		return err
-	}
+	mr := create(m)
 	return m.Add(mr)
 }
 
-func new(mgr manager.Manager) (*runner, error) {
+func create(mgr manager.Manager) *runner {
 	mr := &runner{
 		mgr: mgr,
 	}
-	return mr, nil
+	return mr
 }
 
-// Start implements the Runnable interface
+// Start implements the Runnable interface.
 func (r *runner) Start(ctx context.Context) error {
 	log.Info("Starting metrics runner")
 	defer log.Info("Stopping metrics runner workers")
 	errCh := make(chan error)
-	go func() { errCh <- r.newMetricsExporter() }()
+	exporters := registry.Exporters()
+	common.SetRequiredReaders(len(exporters))
+	for i := range exporters {
+		startExporter := exporters[i]
+		go func() {
+			if err := startExporter(ctx); err != nil {
+				errCh <- err
+			}
+		}()
+	}
 	select {
 	case <-ctx.Done():
-		return r.shutdownMetricsExporter(ctx)
+		return nil
 	case err := <-errCh:
 		if err != nil {
 			return err
 		}
 	}
 	return nil
-}
-
-func (r *runner) newMetricsExporter() error {
-	var e view.Exporter
-	var err error
-	mb := strings.ToLower(*metricsBackend)
-	log.Info("metrics", "backend", mb)
-	switch mb {
-	// Prometheus is the only exporter for now
-	case prometheusExporter:
-		e, err = newPrometheusExporter()
-	default:
-		err = fmt.Errorf("unsupported metrics backend %v", *metricsBackend)
-	}
-	if err != nil {
-		return err
-	}
-	view.RegisterExporter(e)
-	return nil
-}
-
-func (r *runner) shutdownMetricsExporter(ctx context.Context) error {
-	mb := strings.ToLower(*metricsBackend)
-	switch mb {
-	case prometheusExporter:
-		log.Info("shutting down prometheus server")
-		if curPromSrv != nil {
-			if err := curPromSrv.Shutdown(ctx); err != nil {
-				return err
-			}
-		}
-		return nil
-	default:
-		log.Info("nothing to shutdown for unsupported metrics backend %v", *metricsBackend)
-		return nil
-	}
 }

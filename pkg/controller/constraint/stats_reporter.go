@@ -2,75 +2,116 @@ package constraint
 
 import (
 	"context"
+	"sync"
 
-	"github.com/open-policy-agent/gatekeeper/pkg/metrics"
-	"go.opencensus.io/stats"
-	"go.opencensus.io/stats/view"
-	"go.opencensus.io/tag"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/metrics"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 const (
 	constraintsMetricName = "constraints"
+	vapMetricName         = "validating_admission_policies_for_constraints"
+	vapbMetricName        = "validating_admission_policy_bindings"
+	enforcementActionKey  = "enforcement_action"
+	statusKey             = "status"
 )
 
-var (
-	constraintsM = stats.Int64(constraintsMetricName, "Current number of known constraints", stats.UnitDimensionless)
-
-	enforcementActionKey = tag.MustNewKey("enforcement_action")
-	statusKey            = tag.MustNewKey("status")
-)
-
-func init() {
-	if err := register(); err != nil {
-		panic(err)
+func (r *reporter) observeConstraints(_ context.Context, observer metric.Int64Observer) error {
+	r.mux.RLock()
+	defer r.mux.RUnlock()
+	for t, v := range r.constraintsReport {
+		observer.Observe(v, metric.WithAttributes(attribute.String(enforcementActionKey, string(t.enforcementAction)), attribute.String(statusKey, string(t.status))))
 	}
+	return nil
 }
 
-func register() error {
-	views := []*view.View{
-		{
-			Name:        constraintsMetricName,
-			Measure:     constraintsM,
-			Aggregation: view.LastValue(),
-			TagKeys:     []tag.Key{enforcementActionKey, statusKey},
-		},
+func (r *reporter) observeVAPB(_ context.Context, observer metric.Int64Observer) error {
+	totals := r.vapbRegistry.ComputeTotals()
+	for _, status := range metrics.AllVAPStatuses {
+		observer.Observe(totals[status], metric.WithAttributes(attribute.String(statusKey, string(status))))
 	}
-	return view.Register(views...)
+	return nil
 }
 
-func (r *reporter) reportConstraints(t tags, v int64) error {
-	ctx, err := tag.New(
-		r.ctx,
-		tag.Insert(enforcementActionKey, string(t.enforcementAction)),
-		tag.Insert(statusKey, string(t.status)))
-	if err != nil {
-		return err
+func (r *reporter) observeVAP(_ context.Context, observer metric.Int64Observer) error {
+	totals := r.vapRegistry.ComputeTotals()
+	for _, status := range metrics.AllVAPStatuses {
+		observer.Observe(totals[status], metric.WithAttributes(attribute.String(statusKey, string(status))))
 	}
-
-	return r.report(ctx, constraintsM.M(v))
+	return nil
 }
 
-// StatsReporter reports audit metrics
+func (r *reporter) reportConstraints(_ context.Context, t tags, v int64) error {
+	r.mux.Lock()
+	defer r.mux.Unlock()
+	if r.constraintsReport == nil {
+		r.constraintsReport = make(map[tags]int64)
+	}
+	r.constraintsReport[t] = v
+	return nil
+}
+
+// StatsReporter reports audit metrics.
 type StatsReporter interface {
-	reportConstraints(t tags, v int64) error
+	reportConstraints(ctx context.Context, t tags, v int64) error
+	ReportVAPStatus(name types.NamespacedName, status metrics.VAPStatus)
+	DeleteVAPStatus(name types.NamespacedName)
+	ReportVAPBStatus(name types.NamespacedName, status metrics.VAPStatus)
+	DeleteVAPBStatus(name types.NamespacedName)
 }
 
-// newStatsReporter creaters a reporter for audit metrics
-func newStatsReporter() (StatsReporter, error) {
-	ctx, err := tag.New(
-		context.Background(),
+// newStatsReporter creates a reporter for audit metrics.
+func newStatsReporter() (*reporter, error) {
+	r := &reporter{vapRegistry: metrics.NewVAPStatusRegistry(), vapbRegistry: metrics.NewVAPStatusRegistry()}
+	var err error
+	meter := otel.GetMeterProvider().Meter("gatekeeper")
+	_, err = meter.Int64ObservableGauge(
+		constraintsMetricName,
+		metric.WithDescription("Current number of known constraints"), metric.WithInt64Callback(r.observeConstraints))
+	if err != nil {
+		return nil, err
+	}
+	_, err = meter.Int64ObservableGauge(
+		vapMetricName,
+		metric.WithDescription("Number of per-Constraint ValidatingAdmissionPolicy resources by generation status (active = successfully generated, error = generation failed)"),
+		metric.WithInt64Callback(r.observeVAP),
 	)
 	if err != nil {
 		return nil, err
 	}
-
-	return &reporter{ctx: ctx}, nil
+	_, err = meter.Int64ObservableGauge(
+		vapbMetricName,
+		metric.WithDescription("Number of ValidatingAdmissionPolicyBinding resources by generation status (active = successfully generated, error = generation failed)"),
+		metric.WithInt64Callback(r.observeVAPB),
+	)
+	if err != nil {
+		return nil, err
+	}
+	return r, nil
 }
 
 type reporter struct {
-	ctx context.Context
+	mux               sync.RWMutex
+	constraintsReport map[tags]int64
+	vapRegistry       *metrics.VAPStatusRegistry
+	vapbRegistry      *metrics.VAPStatusRegistry
 }
 
-func (r *reporter) report(ctx context.Context, m stats.Measurement) error {
-	return metrics.Record(ctx, m)
+func (r *reporter) ReportVAPStatus(name types.NamespacedName, status metrics.VAPStatus) {
+	r.vapRegistry.Add(name, status)
+}
+
+func (r *reporter) DeleteVAPStatus(name types.NamespacedName) {
+	r.vapRegistry.Remove(name)
+}
+
+func (r *reporter) ReportVAPBStatus(name types.NamespacedName, status metrics.VAPStatus) {
+	r.vapbRegistry.Add(name, status)
+}
+
+func (r *reporter) DeleteVAPBStatus(name types.NamespacedName) {
+	r.vapbRegistry.Remove(name)
 }

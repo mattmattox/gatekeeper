@@ -17,19 +17,25 @@ package webhook
 
 import (
 	"context"
+	"encoding/json"
 	"math/rand"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
-	"time"
 
 	templv1beta1 "github.com/open-policy-agent/frameworks/constraint/pkg/apis/templates/v1beta1"
-	opa "github.com/open-policy-agent/frameworks/constraint/pkg/client"
+	constraintclient "github.com/open-policy-agent/frameworks/constraint/pkg/client"
 	"github.com/open-policy-agent/frameworks/constraint/pkg/core/templates"
-	"github.com/open-policy-agent/gatekeeper/apis/config/v1alpha1"
-	testclient "github.com/open-policy-agent/gatekeeper/test/clients"
+	rtypes "github.com/open-policy-agent/frameworks/constraint/pkg/types"
+	"github.com/open-policy-agent/gatekeeper/v3/apis/config/v1alpha1"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/controller/config/process"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/expansion"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/mutation"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/target"
+	testclient "github.com/open-policy-agent/gatekeeper/v3/test/clients"
 	"github.com/pkg/errors"
 	admissionv1 "k8s.io/api/admission/v1"
 	authenticationv1 "k8s.io/api/authentication/v1"
@@ -38,7 +44,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/uuid"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -51,19 +57,8 @@ type fakeNsGetter struct {
 	scheme *runtime.Scheme
 }
 
-func (f *fakeNsGetter) Get(ctx context.Context, key client.ObjectKey, obj client.Object) error {
-	if ns, ok := obj.(*corev1.Namespace); ok {
-		ns.ObjectMeta = metav1.ObjectMeta{
-			Name: key.Name,
-		}
-		return nil
-	}
-
-	return errors.New("not found")
-}
-
 // getFiles reads a directory and returns a list of files ending with .yaml/.yml
-// returns an error if directory does not exist
+// returns an error if directory does not exist.
 func getFiles(dir string) ([]string, error) {
 	var filePaths []string
 	var err error
@@ -85,11 +80,34 @@ func getFiles(dir string) ([]string, error) {
 	return filePaths, nil
 }
 
+func (f *fakeNsGetter) IsObjectNamespaced(_ runtime.Object) (bool, error) {
+	return false, nil
+}
+
+func (f *fakeNsGetter) GroupVersionKindFor(_ runtime.Object) (schema.GroupVersionKind, error) {
+	return schema.GroupVersionKind{}, nil
+}
+
+func (f *fakeNsGetter) SubResource(_ string) client.SubResourceClient {
+	return nil
+}
+
+func (f *fakeNsGetter) Get(_ context.Context, key client.ObjectKey, obj client.Object, _ ...client.GetOption) error {
+	if ns, ok := obj.(*corev1.Namespace); ok {
+		ns.ObjectMeta = metav1.ObjectMeta{
+			Name: key.Name,
+		}
+		return nil
+	}
+
+	return errors.New("not found")
+}
+
 // readTemplates reads templates from a directory
 // all files ending with .yaml are loaded. One resource per .yaml file
 // does not support recursive directory search
 // fails if directory is not a valid path
-// fails if any of the files is not a valid constraint template
+// fails if any of the files is not a valid constraint template.
 func readTemplates(dir string) ([]templates.ConstraintTemplate, error) {
 	fileList, err := getFiles(dir)
 	if err != nil {
@@ -117,7 +135,7 @@ func readTemplates(dir string) ([]templates.ConstraintTemplate, error) {
 // readConstraints reads constraints from a directory
 // all files ending with .yaml are loaded. One resource per .yaml file
 // does not support recursive directory search
-// fails if directory is not a valid path
+// fails if directory is not a valid path.
 func readConstraints(dir string) ([]unstructured.Unstructured, error) {
 	return readDirHelper(dir)
 }
@@ -126,12 +144,12 @@ func readConstraints(dir string) ([]unstructured.Unstructured, error) {
 // these resources would be transformed into admission requests ex: Pods, Deployments
 // all files ending with .yaml are loaded. One resource per .yaml file
 // does not support recursive directory search
-// fails if directory is not a valid path
+// fails if directory is not a valid path.
 func readResources(dir string) ([]unstructured.Unstructured, error) {
 	return readDirHelper(dir)
 }
 
-// readDirHelper is a helper method to read YAML files and unmarshal them into unstructured
+// readDirHelper is a helper method to read YAML files and unmarshal them into unstructured.
 func readDirHelper(dir string) ([]unstructured.Unstructured, error) {
 	fileList, err := getFiles(dir)
 	if err != nil {
@@ -152,9 +170,9 @@ func readDirHelper(dir string) ([]unstructured.Unstructured, error) {
 	return result, nil
 }
 
-func addTemplates(opa *opa.Client, list []templates.ConstraintTemplate) error {
+func addTemplates(ctx context.Context, opa *constraintclient.Client, list []templates.ConstraintTemplate) error {
 	for index := range list {
-		_, err := opa.AddTemplate(context.TODO(), &list[index])
+		_, err := opa.AddTemplate(ctx, &list[index])
 		if err != nil {
 			return err
 		}
@@ -162,9 +180,9 @@ func addTemplates(opa *opa.Client, list []templates.ConstraintTemplate) error {
 	return nil
 }
 
-func addConstraints(opa *opa.Client, list []unstructured.Unstructured) error {
+func addConstraints(ctx context.Context, opa *constraintclient.Client, list []unstructured.Unstructured) error {
 	for index := range list {
-		_, err := opa.AddConstraint(context.TODO(), &list[index])
+		_, err := opa.AddConstraint(ctx, &list[index])
 		if err != nil {
 			return err
 		}
@@ -172,12 +190,12 @@ func addConstraints(opa *opa.Client, list []unstructured.Unstructured) error {
 	return nil
 }
 
-// generateConstraints generates m constraints based on representative constraint in crList
+// generateConstraints generates m constraints based on representative constraint in crList.
 func generateConstraints(m int, crList []unstructured.Unstructured) []unstructured.Unstructured {
 	result := make([]unstructured.Unstructured, m)
 	for i := 0; i < m; i++ {
 		r := crList[i%len(crList)]
-		result[i] = *(r.DeepCopy())
+		result[i] = *r.DeepCopy()
 		r.SetName(genRandString(10))
 	}
 	return result
@@ -203,9 +221,10 @@ func createAdmissionRequests(resList []unstructured.Unstructured, n int) atypes.
 	res.SetResourceVersion("2")
 	oldRes.SetResourceVersion("1")
 	gvr, _ := meta.UnsafeGuessKindToResource(oldRes.GroupVersionKind())
+	rawObj, _ := json.Marshal(&resList[n%len(resList)])
 	return atypes.Request{
 		AdmissionRequest: admissionv1.AdmissionRequest{
-			UID:                types.UID(uuid.NewUUID()),
+			UID:                uuid.NewUUID(),
 			Kind:               metav1.GroupVersionKind{Group: oldRes.GroupVersionKind().Group, Version: oldRes.GroupVersionKind().Version, Kind: oldRes.GroupVersionKind().Kind},
 			Resource:           metav1.GroupVersionResource{Group: gvr.Group, Version: gvr.Version, Resource: gvr.Resource},
 			SubResource:        "",
@@ -219,8 +238,12 @@ func createAdmissionRequests(resList []unstructured.Unstructured, n int) atypes.
 				Username: "res-creator",
 				UID:      "uid",
 				Groups:   []string{"res-creator-group"},
-				Extra:    map[string]authenticationv1.ExtraValue{"extraKey": {"value1", "value2"}}},
-			Object:    runtime.RawExtension{Object: &resList[n%len(resList)]},
+				Extra:    map[string]authenticationv1.ExtraValue{"extraKey": {"value1", "value2"}},
+			},
+			Object: runtime.RawExtension{
+				Object: &resList[n%len(resList)],
+				Raw:    rawObj,
+			},
 			OldObject: runtime.RawExtension{Object: oldRes},
 			DryRun:    &dryRun,
 			Options:   runtime.RawExtension{},
@@ -228,23 +251,119 @@ func createAdmissionRequests(resList []unstructured.Unstructured, n int) atypes.
 	}
 }
 
-func BenchmarkValidationHandler(b *testing.B) {
-	// setup test
-	opa, err := makeOpaClient()
-	if err != nil {
-		b.Fatalf("could not initialize OPA: %s", err)
-	}
+func BenchmarkSkipExcludedNamespaceNoExclusions(b *testing.B) {
+	for _, payloadSize := range []int{10 << 10, 100 << 10, 1024 << 10} {
+		req := largeConfigMapAdmissionRequest(payloadSize)
+		h := webhookHandler{processExcluder: process.New()}
 
-	c := &fakeNsGetter{scheme: runtimeScheme, NoopClient: testclient.NoopClient{}}
-	cfg := &v1alpha1.Config{
-		Spec: v1alpha1.ConfigSpec{
-			Validation: v1alpha1.Validation{
-				Traces: []v1alpha1.Trace{},
-			},
+		b.Run(strconv.Itoa(payloadSize), func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				excluded, err := h.skipExcludedNamespace(&req.AdmissionRequest, process.Webhook)
+				if err != nil {
+					b.Fatalf("skipExcludedNamespace() error = %v", err)
+				}
+				if excluded {
+					b.Fatal("skipExcludedNamespace() = true, want false")
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkValidationExpansionNoTemplates(b *testing.B) {
+	for _, payloadSize := range []int{10 << 10, 100 << 10, 1024 << 10} {
+		req := largeConfigMapAdmissionRequest(payloadSize)
+		h := validationHandler{
+			expansionSystem: expansion.NewSystem(mutation.NewSystem(mutation.SystemOpts{})),
+		}
+		review := &target.AugmentedReview{
+			AdmissionRequest: &req.AdmissionRequest,
+			IsAdmission:      true,
+		}
+
+		b.Run(strconv.Itoa(payloadSize), func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				resultants, err := h.expandRequest(&req, review)
+				if err != nil {
+					b.Fatalf("expandRequest() error = %v", err)
+				}
+				if len(resultants) != 0 {
+					b.Fatalf("resultants = %d, want 0", len(resultants))
+				}
+			}
+		})
+	}
+}
+
+func largeConfigMapAdmissionRequest(payloadSize int) atypes.Request {
+	data := map[string]interface{}{
+		"payload": strings.Repeat("x", payloadSize),
+	}
+	obj := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "v1",
+		"kind":       "ConfigMap",
+		"metadata": map[string]interface{}{
+			"name":      "benchmark-configmap",
+			"namespace": "benchmark-ns",
 		},
-	}
-	h := validationHandler{opa: opa, webhookHandler: webhookHandler{client: c, injectedConfig: cfg}}
+		"data": data,
+	}}
+	rawObj, _ := json.Marshal(obj.Object)
+	return atypes.Request{AdmissionRequest: admissionv1.AdmissionRequest{
+		Kind:      metav1.GroupVersionKind{Group: "", Version: "v1", Kind: "ConfigMap"},
+		Resource:  metav1.GroupVersionResource{Group: "", Version: "v1", Resource: "configmaps"},
+		Name:      "benchmark-configmap",
+		Namespace: "benchmark-ns",
+		Operation: admissionv1.Create,
+		UserInfo:  authenticationv1.UserInfo{Username: "benchmark-user"},
+		Object: runtime.RawExtension{
+			Object: obj,
+			Raw:    rawObj,
+		},
+	}}
+}
 
+func BenchmarkValidationMessagesDenyScale(b *testing.B) {
+	for _, resultCount := range []int{100, 1000, 10000} {
+		results := make([]*rtypes.Result, resultCount)
+		for i := 0; i < resultCount; i++ {
+			constraint := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "constraints.gatekeeper.sh/v1beta1",
+				"kind":       "K8sBenchmark",
+				"metadata": map[string]interface{}{
+					"name": "constraint-" + strconv.Itoa(i),
+				},
+			}}
+			results[i] = &rtypes.Result{
+				Msg:               "benchmark violation",
+				Constraint:        constraint,
+				EnforcementAction: "deny",
+			}
+		}
+		req := atypes.Request{AdmissionRequest: admissionv1.AdmissionRequest{
+			Kind:      metav1.GroupVersionKind{Group: "", Version: "v1", Kind: "ConfigMap"},
+			Resource:  metav1.GroupVersionResource{Group: "", Version: "v1", Resource: "configmaps"},
+			Name:      "benchmark-configmap",
+			Operation: admissionv1.Create,
+			UserInfo:  authenticationv1.UserInfo{Username: "benchmark-user"},
+		}}
+		h := validationHandler{log: log}
+
+		b.Run("results-"+strconv.Itoa(resultCount), func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				denyMsgs, warnMsgs, _ := h.processValidationResults(results, &req)
+				if len(denyMsgs) != resultCount || len(warnMsgs) != 0 {
+					b.Fatalf("deny,warn counts = %d,%d; want %d,0", len(denyMsgs), len(warnMsgs), resultCount)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkValidationHandler(b *testing.B) {
 	benchmarks := map[string]struct {
 		// description of the test
 		description string
@@ -267,6 +386,7 @@ func BenchmarkValidationHandler(b *testing.B) {
 		},
 		// create template, constraint and resource directories and add a new test case with appropriate load values
 	}
+
 	for name, tc := range benchmarks {
 		// read template
 		ctList, err := readTemplates(tc.templateDir)
@@ -288,20 +408,40 @@ func BenchmarkValidationHandler(b *testing.B) {
 
 		for _, bm := range tc.load {
 			// remove all data from OPA
-			err = opa.Reset(context.TODO())
+			ctx := context.Background()
+
+			// setup test
+			opaClient, err := makeOpaClient()
 			if err != nil {
-				b.Errorf("test %s, failed to reset OPA: %s", name, err)
+				b.Fatalf("could not initialize OPA: %s", err)
 			}
-			// seed random generator
-			rand.Seed(time.Now().UnixNano())
+
+			c := &fakeNsGetter{scheme: runtimeScheme, NoopClient: testclient.NoopClient{}}
+			cfg := &v1alpha1.Config{
+				Spec: v1alpha1.ConfigSpec{
+					Validation: v1alpha1.Validation{
+						Traces: []v1alpha1.Trace{},
+					},
+				},
+			}
+			h := validationHandler{
+				opa:             opaClient,
+				expansionSystem: expansion.NewSystem(mutation.NewSystem(mutation.SystemOpts{})),
+				webhookHandler: webhookHandler{
+					processExcluder: process.Get(),
+					client:          c,
+					injectedConfig:  cfg,
+				},
+				log: log,
+			}
 
 			// create T templates
-			err = addTemplates(opa, ctList)
+			err = addTemplates(ctx, opaClient, ctList)
 			if err != nil {
 				b.Errorf("test %s, failed to load templates into OPA: %s", name, err)
 			}
 			// load constraints into OPA
-			err = addConstraints(opa, generateConstraints(bm, crList))
+			err = addConstraints(ctx, opaClient, generateConstraints(bm, crList))
 			if err != nil {
 				b.Errorf("test %s, failed to load constraints into OPA: %s", name, err)
 			}
@@ -311,17 +451,12 @@ func BenchmarkValidationHandler(b *testing.B) {
 					b.StopTimer()
 					req := createAdmissionRequests(resList, i)
 					b.StartTimer()
-					resp := h.Handle(context.TODO(), req)
+					resp := h.Handle(ctx, req)
 					if resp.Result.Code == http.StatusInternalServerError || resp.Result.Code == http.StatusUnprocessableEntity {
 						b.Errorf("expected a decision, received server error %d on test %s", resp.Result.Code, name)
 					}
 				}
 			})
-			// remove all data from OPA
-			err = opa.Reset(context.TODO())
-			if err != nil {
-				b.Errorf("test %s, failed to reset OPA: %s", name, err)
-			}
 		}
 	}
 }

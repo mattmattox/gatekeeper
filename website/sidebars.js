@@ -23,21 +23,53 @@ module.exports = {
         'library',
         'customize-startup',
         'customize-admission',
+        'remote-cluster',
         'metrics',
         'debug',
         'emergency',
         'vendor-specific',
         'failing-closed',
-        'mutation'
+        'mutation',
+        'constrainttemplates',
+        'externaldata',
+        'expansion',
+        'gator',
+        'workload-resources',
+        'export',
+        'validating-admission-policy',
+        'enforcement-points',
+        'runtime-flags',
+        'api'
       ],
+    },
+    {
+      type: 'category',
+      label: 'Architecture',
+      collapsed: false,
+      items: [
+        'operations',
+        'performance-tuning',
+        'opa-versions'
+      ],
+    },
+    {
+      type: 'category',
+      label: 'Concepts',
+      collapsed: false,
+      items: [
+        'input',
+        'mutation-background'
+      ]
     },
     {
       type: 'category',
       label: 'Contributing',
       collapsed: false,
       items: [
+        'developers',
         'help',
-        'security'
+        'security',
+        'export-driver'
       ],
     }
   ]

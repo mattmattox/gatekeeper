@@ -1,6 +1,8 @@
 # Staging and temporary dirs
 .staging/
 /.tmp
+go.work
+go.work.sum
 
 # Binaries for programs and plugins
 *.exe
@@ -9,6 +11,7 @@
 *.so
 *.dylib
 bin
+_dist
 
 # Test binary, build with `go test -c`
 *.test
@@ -20,9 +23,7 @@ bin
 config/overlays/dev/manager_image_patch.yaml
 config/overlays/dev_mutation/manager_image_patch.yaml
 
-# Kubernetes Generated files - skip generated files, except for vendored files
-
-!vendor/**/zz_generated.*
+# Kubernetes Generated files - skip generated files
 
 # editor and IDE paraphernalia
 .idea
@@ -347,5 +348,12 @@ __pycache__/
 *.odx.cs
 *.xsd.cs
 
-# always include vendor directory
-!/vendor/**
+# tilt
+tilt-settings.json
+.tiltbuild
+
+# cluster-test
+/cluster-test
+
+# dummy provider's certificate directory
+test/externaldata/dummy-provider/certs/

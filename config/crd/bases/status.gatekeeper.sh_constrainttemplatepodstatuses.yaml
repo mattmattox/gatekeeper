@@ -1,11 +1,9 @@
-
 ---
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.5.0
-  creationTimestamp: null
+    controller-gen.kubebuilder.io/version: v0.21.0
   name: constrainttemplatepodstatuses.status.gatekeeper.sh
 spec:
   group: status.gatekeeper.sh
@@ -19,22 +17,37 @@ spec:
   - name: v1beta1
     schema:
       openAPIV3Schema:
-        description: ConstraintTemplatePodStatus is the Schema for the constrainttemplatepodstatuses API
+        description: ConstraintTemplatePodStatus is the Schema for the constrainttemplatepodstatuses
+          API.
         properties:
           apiVersion:
-            description: 'APIVersion defines the versioned schema of this representation of an object. Servers should convert recognized schemas to the latest internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources'
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
             type: string
           kind:
-            description: 'Kind is a string value representing the REST resource this object represents. Servers may infer this from the endpoint the client submits requests to. Cannot be updated. In CamelCase. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds'
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
             type: string
           metadata:
             type: object
           status:
-            description: ConstraintTemplatePodStatusStatus defines the observed state of ConstraintTemplatePodStatus
+            description: status is the observed state of the ConstraintTemplate for
+              this pod.
             properties:
               errors:
+                description: |-
+                  errors lists any errors encountered while creating the CRD for the
+                  ConstraintTemplate on this pod.
                 items:
-                  description: CreateCRDError represents a single error caught during parsing, compiling, etc.
+                  description: CreateCRDError represents a single error caught during
+                    parsing, compiling, etc.
                   properties:
                     code:
                       type: string
@@ -48,25 +61,49 @@ spec:
                   type: object
                 type: array
               id:
-                description: 'Important: Run "make" to regenerate code after modifying this file'
+                description: id is the name of the pod that generated this status.
                 type: string
               observedGeneration:
+                description: |-
+                  observedGeneration is the generation of the ConstraintTemplate that was last
+                  processed by this pod.
                 format: int64
                 type: integer
               operations:
+                description: |-
+                  operations lists the Gatekeeper operations assigned to the pod that generated
+                  this status.
                 items:
                   type: string
                 type: array
               templateUID:
-                description: UID is a type that holds unique ID values, including UUIDs.  Because we don't ONLY use UUIDs, this is an alias to string.  Being a type captures intent and helps make sure that UIDs and names do not get conflated.
+                description: |-
+                  templateUID is the UID of the ConstraintTemplate this status reports on. It
+                  is used to ignore statuses that belong to a previous ConstraintTemplate with
+                  the same name, for example after it was deleted and recreated.
                 type: string
+              vapGenerationStatus:
+                description: |-
+                  vapGenerationStatus reports the status of generating a ValidatingAdmissionPolicy
+                  for the ConstraintTemplate on this pod.
+                properties:
+                  observedGeneration:
+                    description: |-
+                      observedGeneration is the generation of the ConstraintTemplate that was last
+                      processed for ValidatingAdmissionPolicy generation.
+                    format: int64
+                    type: integer
+                  state:
+                    description: state is the current state of ValidatingAdmissionPolicy
+                      generation.
+                    type: string
+                  warning:
+                    description: |-
+                      warning contains a human-readable warning encountered while generating the
+                      ValidatingAdmissionPolicy, if any.
+                    type: string
+                type: object
             type: object
         type: object
     served: true
     storage: true
-status:
-  acceptedNames:
-    kind: ""
-    plural: ""
-  conditions: []
-  storedVersions: []

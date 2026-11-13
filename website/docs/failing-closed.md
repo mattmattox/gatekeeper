@@ -3,6 +3,10 @@ id: failing-closed
 title: Failing Closed
 ---
 
+## Admission Webhook Fail-Open by Default
+
+Currently Gatekeeper is defaulting to using `failurePolicy: Ignore` for admission request webhook errors. The impact of this is that when the webhook is down, or otherwise unreachable, constraints will not be enforced. Audit is expected to pick up any slack in enforcement by highlighting invalid resources that made it into the cluster.
+
 Here we discuss how to configure Gatekeeper to fail closed and some factors you may want to consider before doing so.
 
 ## How to Fail Closed
@@ -145,4 +149,4 @@ Different clusters may have different backing physical infrastructures and diffe
 
 ## Why Is This Hard?
 
-In a nutshell it's because it's a webhook, and because it's self-hosted. All REST servers require enough high-availabily infrastructure to satisfy their SLOs (see cloud availability zones / regions). Self-hosted webhooks create a circular dependency that has the potential to interfere with the self-healing Kubenetes usually provides. Any self-hosted admission webhook would be subject to these same concerns.
+In a nutshell it's because it's a webhook, and because it's self-hosted. All REST servers require enough high-availabily infrastructure to satisfy their SLOs (see cloud availability zones / regions). Self-hosted webhooks create a circular dependency that has the potential to interfere with the self-healing Kubernetes usually provides. Any self-hosted admission webhook would be subject to these same concerns.

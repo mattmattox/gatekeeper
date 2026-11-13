@@ -16,111 +16,613 @@ limitations under the License.
 package constrainttemplate
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/onsi/gomega"
+	"github.com/go-logr/logr"
+	templatesv1 "github.com/open-policy-agent/frameworks/constraint/pkg/apis/templates/v1"
 	"github.com/open-policy-agent/frameworks/constraint/pkg/apis/templates/v1beta1"
-	opa "github.com/open-policy-agent/frameworks/constraint/pkg/client"
-	"github.com/open-policy-agent/frameworks/constraint/pkg/client/drivers/local"
-	podstatus "github.com/open-policy-agent/gatekeeper/apis/status/v1beta1"
-	statusv1beta1 "github.com/open-policy-agent/gatekeeper/apis/status/v1beta1"
-	"github.com/open-policy-agent/gatekeeper/pkg/readiness"
-	"github.com/open-policy-agent/gatekeeper/pkg/target"
-	"github.com/open-policy-agent/gatekeeper/pkg/util"
-	"github.com/open-policy-agent/gatekeeper/pkg/watch"
-	testclient "github.com/open-policy-agent/gatekeeper/test/clients"
-	"github.com/open-policy-agent/gatekeeper/third_party/sigs.k8s.io/controller-runtime/pkg/dynamiccache"
-	"github.com/prometheus/client_golang/prometheus"
-	"golang.org/x/net/context"
+	constraintclient "github.com/open-policy-agent/frameworks/constraint/pkg/client"
+	"github.com/open-policy-agent/frameworks/constraint/pkg/client/drivers/rego"
+	"github.com/open-policy-agent/frameworks/constraint/pkg/client/reviews"
+	"github.com/open-policy-agent/frameworks/constraint/pkg/core/templates"
+	"github.com/open-policy-agent/gatekeeper/v3/apis"
+	configv1alpha1 "github.com/open-policy-agent/gatekeeper/v3/apis/config/v1alpha1"
+	statusv1beta1 "github.com/open-policy-agent/gatekeeper/v3/apis/status/v1beta1"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/controller/config/process"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/controller/constraint"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/controller/webhookconfig/webhookconfigcache"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/drivers/k8scel"
+	celSchema "github.com/open-policy-agent/gatekeeper/v3/pkg/drivers/k8scel/schema"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/drivers/k8scel/transform"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/fakes"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/metrics"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/readiness"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/target"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/util"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/webhook"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/wildcard"
+	testclient "github.com/open-policy-agent/gatekeeper/v3/test/clients"
+	"github.com/open-policy-agent/gatekeeper/v3/test/testutils"
+	"github.com/stretchr/testify/require"
 	admissionv1 "k8s.io/api/admission/v1"
+	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
+	admissionregistrationv1beta1 "k8s.io/api/admissionregistration/v1beta1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	errors2 "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
-	ctrl "sigs.k8s.io/controller-runtime"
+	"k8s.io/client-go/util/retry"
+	"k8s.io/client-go/util/workqueue"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
+	crfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
-	"sigs.k8s.io/controller-runtime/pkg/log/zap"
-	"sigs.k8s.io/controller-runtime/pkg/manager"
-	"sigs.k8s.io/controller-runtime/pkg/metrics"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
-const timeout = time.Second * 15
+const (
+	DenyAll = "DenyAll"
+	denyall = "denyall"
+)
 
-// setupManager sets up a controller-runtime manager with registered watch manager.
-func setupManager(t *testing.T) (manager.Manager, *watch.Manager) {
-	t.Helper()
+// globalTestMu serializes access to all global variables (webhook.VwhName, transform.SyncVAPScope)
+// across all constraint template tests to prevent race conditions.
+var globalTestMu sync.Mutex
 
-	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
-	metrics.Registry = prometheus.NewRegistry()
-	mgr, err := manager.New(cfg, manager.Options{
-		MetricsBindAddress: "0",
-		NewCache:           dynamiccache.New,
-		MapperProvider: func(c *rest.Config) (meta.RESTMapper, error) {
-			return apiutil.NewDynamicRESTMapper(c)
-		},
-	})
-	if err != nil {
-		t.Fatalf("setting up controller manager: %s", err)
-	}
-	c := mgr.GetCache()
-	dc, ok := c.(watch.RemovableCache)
-	if !ok {
-		t.Fatalf("expected dynamic cache, got: %T", c)
-	}
-	wm, err := watch.New(dc)
-	if err != nil {
-		t.Fatalf("could not create watch manager: %s", err)
-	}
-	if err := mgr.Add(wm); err != nil {
-		t.Fatalf("could not add watch manager to manager: %s", err)
-	}
-	return mgr, wm
+type statusTrackingClient struct {
+	client.Client
+	creates  int
+	updates  int
+	writeErr error
 }
 
-func TestReconcile(t *testing.T) {
-	crdKey := types.NamespacedName{Name: "denyall.constraints.gatekeeper.sh"}
-	g := gomega.NewGomegaWithT(t)
-	instance := &v1beta1.ConstraintTemplate{
-		ObjectMeta: metav1.ObjectMeta{Name: "denyall"},
+type reconcileTrackingClient struct {
+	client.Client
+	crdGetErr       error
+	crdUpdateErr    error
+	statusCreateErr error
+	statusUpdateErr error
+	statusCreates   int
+	statusUpdates   int
+}
+
+func (c *reconcileTrackingClient) Get(ctx context.Context, key types.NamespacedName, obj client.Object, opts ...client.GetOption) error {
+	if _, ok := obj.(*apiextensionsv1.CustomResourceDefinition); ok && c.crdGetErr != nil {
+		return c.crdGetErr
+	}
+	return c.Client.Get(ctx, key, obj, opts...)
+}
+
+func (c *reconcileTrackingClient) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
+	if _, ok := obj.(*statusv1beta1.ConstraintTemplatePodStatus); ok {
+		c.statusCreates++
+		if c.statusCreateErr != nil {
+			return c.statusCreateErr
+		}
+	}
+	return c.Client.Create(ctx, obj, opts...)
+}
+
+func (c *reconcileTrackingClient) Update(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
+	switch obj.(type) {
+	case *statusv1beta1.ConstraintTemplatePodStatus:
+		c.statusUpdates++
+		if c.statusUpdateErr != nil {
+			return c.statusUpdateErr
+		}
+	case *apiextensionsv1.CustomResourceDefinition:
+		if c.crdUpdateErr != nil {
+			return c.crdUpdateErr
+		}
+	}
+	return c.Client.Update(ctx, obj, opts...)
+}
+
+func newUnitReconciler(t *testing.T, objects ...client.Object) (*ReconcileConstraintTemplate, *reconcileTrackingClient) {
+	t.Helper()
+	testutils.Setenv(t, "POD_NAME", "test-pod")
+
+	scheme := runtime.NewScheme()
+	require.NoError(t, v1beta1.AddToScheme(scheme))
+	require.NoError(t, statusv1beta1.AddToScheme(scheme))
+	require.NoError(t, apiextensionsv1.AddToScheme(scheme))
+	require.NoError(t, corev1.AddToScheme(scheme))
+
+	baseClient := crfake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
+	trackingClient := &reconcileTrackingClient{Client: baseClient}
+
+	regoDriver, err := rego.New(rego.Tracing(true))
+	require.NoError(t, err)
+	celDriver, err := k8scel.New()
+	require.NoError(t, err)
+	cfClient, err := constraintclient.NewClient(
+		constraintclient.Targets(&target.K8sValidationTarget{}),
+		constraintclient.Driver(regoDriver),
+		constraintclient.Driver(celDriver),
+		constraintclient.EnforcementPoints(util.AuditEnforcementPoint),
+	)
+	require.NoError(t, err)
+
+	pod := fakes.Pod(
+		fakes.WithNamespace("gatekeeper-system"),
+		fakes.WithName("test-pod"),
+	)
+	tracker := readiness.NewTracker(trackingClient, false, false, false)
+	trackerCtx, cancelTracker := context.WithCancel(context.Background())
+	cancelTracker()
+	require.NoError(t, tracker.Run(trackerCtx))
+	return &ReconcileConstraintTemplate{
+		Client:    trackingClient,
+		apiReader: trackingClient,
+		scheme:    scheme,
+		cfClient:  cfClient,
+		metrics:   newStatsReporter(),
+		tracker:   tracker,
+		getPod:    func(context.Context) (*corev1.Pod, error) { return pod, nil },
+	}, trackingClient
+}
+
+func (c *statusTrackingClient) Update(_ context.Context, _ client.Object, _ ...client.UpdateOption) error {
+	c.updates++
+	return c.writeErr
+}
+
+func (c *statusTrackingClient) Create(_ context.Context, _ client.Object, _ ...client.CreateOption) error {
+	c.creates++
+	return c.writeErr
+}
+
+func makeReconcileConstraintTemplate(suffix string) *v1beta1.ConstraintTemplate {
+	return &v1beta1.ConstraintTemplate{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "ConstraintTemplate",
+			APIVersion: templatesv1.SchemeGroupVersion.String(),
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: denyall + strings.ToLower(suffix),
+		},
 		Spec: v1beta1.ConstraintTemplateSpec{
 			CRD: v1beta1.CRD{
 				Spec: v1beta1.CRDSpec{
 					Names: v1beta1.Names{
-						Kind: "DenyAll",
+						Kind: DenyAll + suffix,
 					},
 				},
 			},
 			Targets: []v1beta1.Target{
 				{
-					Target: "admission.k8s.gatekeeper.sh",
+					Target: target.Name,
 					Rego: `
 package foo
 
 violation[{"msg": "denied!"}] {
 	1 == 1
 }
-`},
+`,
+				},
 			},
 		},
 	}
+}
 
+func makeReconcileConstraintTemplateWithRegoEngine(suffix string) *v1beta1.ConstraintTemplate {
+	return &v1beta1.ConstraintTemplate{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "ConstraintTemplate",
+			APIVersion: templatesv1.SchemeGroupVersion.String(),
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: denyall + strings.ToLower(suffix),
+		},
+		Spec: v1beta1.ConstraintTemplateSpec{
+			CRD: v1beta1.CRD{
+				Spec: v1beta1.CRDSpec{
+					Names: v1beta1.Names{
+						Kind: DenyAll + suffix,
+					},
+				},
+			},
+			Targets: []v1beta1.Target{
+				{
+					Target: target.Name,
+					Code: []v1beta1.Code{
+						{
+							Engine: "Rego",
+							Source: &templates.Anything{
+								Value: `
+package foo
+
+violation[{"msg": "denied!"}] {
+	1 == 1
+}
+`,
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func makeReconcileConstraintTemplateForVap(suffix string, generateVAP *bool, ops []admissionregistrationv1.OperationType) *v1beta1.ConstraintTemplate {
+	source := &celSchema.Source{
+		FailurePolicy: ptr.To[string]("Fail"),
+		MatchConditions: []celSchema.MatchCondition{
+			{
+				Name:       "must_match_something",
+				Expression: "true == true",
+			},
+		},
+		Variables: []celSchema.Variable{
+			{
+				Name:       "my_variable",
+				Expression: "true",
+			},
+		},
+		Validations: []celSchema.Validation{
+			{
+				Expression:        "1 == 1",
+				Message:           "some fallback message",
+				MessageExpression: `"some CEL string"`,
+			},
+		},
+		GenerateVAP: generateVAP,
+	}
+
+	return &v1beta1.ConstraintTemplate{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "ConstraintTemplate",
+			APIVersion: templatesv1.SchemeGroupVersion.String(),
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: denyall + strings.ToLower(suffix),
+		},
+		Spec: v1beta1.ConstraintTemplateSpec{
+			CRD: v1beta1.CRD{
+				Spec: v1beta1.CRDSpec{
+					Names: v1beta1.Names{
+						Kind: DenyAll + suffix,
+					},
+				},
+			},
+			Targets: []v1beta1.Target{
+				{
+					Target:     target.Name,
+					Operations: ops,
+					Code: []v1beta1.Code{
+						{
+							Engine: "K8sNativeValidation",
+							Source: &templates.Anything{
+								Value: source.MustToUnstructured(),
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func crdKey(suffix string) types.NamespacedName {
+	return types.NamespacedName{Name: fmt.Sprintf("denyall%s.constraints.gatekeeper.sh", strings.ToLower(suffix))}
+}
+
+func expectedCRD(suffix string) *apiextensions.CustomResourceDefinition {
+	crd := &apiextensions.CustomResourceDefinition{}
+	key := crdKey(suffix)
+	crd.SetName(key.Name)
+	crd.SetGroupVersionKind(apiextensionsv1.SchemeGroupVersion.WithKind("CustomResourceDefinition"))
+	return crd
+}
+
+func getMatchEntryConfig() []configv1alpha1.MatchEntry {
+	return []configv1alpha1.MatchEntry{
+		{
+			ExcludedNamespaces: []wildcard.Wildcard{"foo"},
+			Processes:          []string{"*"},
+		},
+	}
+}
+
+func cloneGroupVersionPtr(value *schema.GroupVersion) *schema.GroupVersion {
+	if value == nil {
+		return nil
+	}
+	clone := *value
+	return &clone
+}
+
+func setVAPTestGlobals(t *testing.T, groupVersion *schema.GroupVersion) {
+	t.Helper()
+	t.Cleanup(func() {
+		transform.SetVapAPIEnabled(nil)
+		transform.SetGroupVersion(nil)
+	})
+
+	transform.SetVapAPIEnabled(ptr.To[bool](true))
+	transform.SetGroupVersion(cloneGroupVersionPtr(groupVersion))
+}
+
+func setupVersionPinnedReconcileTest(t *testing.T, groupVersion *schema.GroupVersion) (context.Context, client.Client) {
+	t.Helper()
+
+	setVAPTestGlobals(t, groupVersion)
+
+	mgr, wm := testutils.SetupManager(t, cfg)
+	c := testclient.NewRetryClient(mgr.GetClient())
+
+	err := testutils.CreateGatekeeperNamespace(mgr.GetConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	driver, err := rego.New(rego.Tracing(true))
+	if err != nil {
+		t.Fatalf("unable to set up Driver: %v", err)
+	}
+	k8sDriver, err := k8scel.New()
+	if err != nil {
+		t.Fatalf("unable to set up K8s native driver: %v", err)
+	}
+
+	cfClient, err := constraintclient.NewClient(constraintclient.Targets(&target.K8sValidationTarget{}), constraintclient.Driver(driver), constraintclient.Driver(k8sDriver), constraintclient.EnforcementPoints(util.AuditEnforcementPoint))
+	if err != nil {
+		t.Fatalf("unable to set up constraint framework client: %s", err)
+	}
+
+	testutils.Setenv(t, "POD_NAME", "no-pod")
+
+	tracker, err := readiness.SetupTracker(mgr, false, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pod := fakes.Pod(
+		fakes.WithNamespace("gatekeeper-system"),
+		fakes.WithName("no-pod"),
+	)
+
+	constraintEvents := make(chan event.GenericEvent, 1024)
+	constraintTemplateEvents := make(chan event.GenericEvent, 1024)
+	processExcluder := process.New()
+	processExcluder.Add(getMatchEntryConfig())
+
+	webhookCache := webhookconfigcache.NewWebhookConfigCache()
+	const testWebhookName = "gatekeeper-validating-webhook-configuration"
+	webhookName := testWebhookName
+	originalVwhName := webhook.VwhName
+	t.Cleanup(func() { webhook.VwhName = originalVwhName })
+	webhook.VwhName = &webhookName
+
+	exactMatch := admissionregistrationv1.Exact
+	webhookCache.UpsertConfig(testWebhookName, webhookconfigcache.WebhookMatchingConfig{
+		Rules: []admissionregistrationv1.RuleWithOperations{
+			{
+				Operations: []admissionregistrationv1.OperationType{
+					admissionregistrationv1.Create,
+					admissionregistrationv1.Update,
+					admissionregistrationv1.Delete,
+					admissionregistrationv1.Connect,
+				},
+				Rule: admissionregistrationv1.Rule{
+					APIGroups:   []string{""},
+					APIVersions: []string{"v1"},
+					Resources:   []string{"*"},
+				},
+			},
+		},
+		MatchPolicy: &exactMatch,
+	})
+
+	rec, err := newReconciler(mgr, cfClient, wm, tracker, constraintEvents, constraintEvents, func(context.Context) (*corev1.Pod, error) { return pod, nil }, webhookCache, processExcluder)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = add(mgr, rec, constraintTemplateEvents)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	testutils.StartManager(ctx, t, mgr)
+
+	origWait := constraint.GetDefaultWaitForVAPBGeneration()
+	constraint.SetDefaultWaitForVAPBGeneration(2)
+	t.Cleanup(func() { constraint.SetDefaultWaitForVAPBGeneration(origWait) })
+
+	return ctx, c
+}
+
+type ctCountingClient struct {
+	client.Client
+	updates int
+}
+
+func (c *ctCountingClient) Update(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
+	if err := c.Client.Update(ctx, obj, opts...); err != nil {
+		return err
+	}
+	c.updates++
+	return nil
+}
+
+func TestPersistPodStatusSkipsNoopAndWritesChanges(t *testing.T) {
+	ctx := context.Background()
+	scheme := runtime.NewScheme()
+	require.NoError(t, apis.AddToScheme(scheme))
+
+	baseStatus := statusv1beta1.ConstraintTemplatePodStatusStatus{
+		TemplateUID:        "template-uid",
+		ObservedGeneration: 1,
+		VAPGenerationStatus: &statusv1beta1.VAPGenerationStatus{
+			State:              GeneratedVAPState,
+			ObservedGeneration: 1,
+		},
+	}
+
+	tests := []struct {
+		name       string
+		oldStatus  statusv1beta1.ConstraintTemplatePodStatusStatus
+		newStatus  statusv1beta1.ConstraintTemplatePodStatusStatus
+		wantWrites int
+	}{
+		{
+			name:      "unchanged generated VAP status skips write even with distinct pointer",
+			oldStatus: *baseStatus.DeepCopy(),
+			newStatus: *baseStatus.DeepCopy(),
+		},
+		{
+			name:      "observed generation change writes",
+			oldStatus: *baseStatus.DeepCopy(),
+			newStatus: func() statusv1beta1.ConstraintTemplatePodStatusStatus {
+				status := *baseStatus.DeepCopy()
+				status.ObservedGeneration++
+				return status
+			}(),
+			wantWrites: 1,
+		},
+		{
+			name:      "VAP warning change writes",
+			oldStatus: *baseStatus.DeepCopy(),
+			newStatus: func() statusv1beta1.ConstraintTemplatePodStatusStatus {
+				status := *baseStatus.DeepCopy()
+				status.VAPGenerationStatus.Warning = "changed"
+				return status
+			}(),
+			wantWrites: 1,
+		},
+		{
+			name: "stale errors cleared writes",
+			oldStatus: statusv1beta1.ConstraintTemplatePodStatusStatus{
+				TemplateUID:        "template-uid",
+				ObservedGeneration: 1,
+				Errors:             []*v1beta1.CreateCRDError{{Code: ErrCreateCode, Message: "stale"}},
+			},
+			newStatus:  statusv1beta1.ConstraintTemplatePodStatusStatus{TemplateUID: "template-uid", ObservedGeneration: 1},
+			wantWrites: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			status := &statusv1beta1.ConstraintTemplatePodStatus{
+				ObjectMeta: metav1.ObjectMeta{Name: "status", Namespace: util.GetNamespace()},
+				Status:     tt.oldStatus,
+			}
+			k8sClient := &ctCountingClient{Client: crfake.NewClientBuilder().WithScheme(scheme).WithObjects(status.DeepCopy()).Build()}
+			reconciler := &ReconcileConstraintTemplate{Client: k8sClient}
+
+			toUpdate := &statusv1beta1.ConstraintTemplatePodStatus{}
+			require.NoError(t, k8sClient.Get(ctx, client.ObjectKeyFromObject(status), toUpdate))
+			toUpdate.Status = tt.newStatus
+			require.NoError(t, reconciler.persistPodStatus(ctx, toUpdate, status.Status.DeepCopy()))
+			require.Equal(t, tt.wantWrites, k8sClient.updates)
+		})
+	}
+}
+
+func BenchmarkPersistPodStatusNoop(b *testing.B) {
+	ctx := context.Background()
+	scheme := runtime.NewScheme()
+	require.NoError(b, apis.AddToScheme(scheme))
+
+	status := &statusv1beta1.ConstraintTemplatePodStatus{
+		ObjectMeta: metav1.ObjectMeta{Name: "status", Namespace: util.GetNamespace()},
+		Status: statusv1beta1.ConstraintTemplatePodStatusStatus{
+			TemplateUID:        "template-uid",
+			ObservedGeneration: 1,
+			VAPGenerationStatus: &statusv1beta1.VAPGenerationStatus{
+				State:              GeneratedVAPState,
+				ObservedGeneration: 1,
+			},
+		},
+	}
+	k8sClient := &ctCountingClient{Client: crfake.NewClientBuilder().WithScheme(scheme).WithObjects(status.DeepCopy()).Build()}
+	reconciler := &ReconcileConstraintTemplate{Client: k8sClient}
+	oldStatus := status.Status.DeepCopy()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := reconciler.persistPodStatus(ctx, status, oldStatus); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.StopTimer()
+	b.ReportMetric(float64(k8sClient.updates)/float64(b.N), "updates/op")
+}
+
+type constraintListClient struct {
+	client.Client
+	items []unstructured.Unstructured
+}
+
+func (c *constraintListClient) List(_ context.Context, list client.ObjectList, _ ...client.ListOption) error {
+	unstructuredList, ok := list.(*unstructured.UnstructuredList)
+	if !ok {
+		return fmt.Errorf("expected *unstructured.UnstructuredList, got %T", list)
+	}
+	unstructuredList.Items = c.items
+	return nil
+}
+
+func BenchmarkTriggerConstraintEvents(b *testing.B) {
+	for _, itemCount := range []int{100, 1000, 10000} {
+		items := make([]unstructured.Unstructured, itemCount)
+		for i := 0; i < itemCount; i++ {
+			items[i] = unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "constraints.gatekeeper.sh/v1beta1",
+				"kind":       "TestKind",
+				"metadata": map[string]interface{}{
+					"name": "constraint-" + strconv.Itoa(i),
+				},
+			}}
+		}
+
+		b.Run("constraints-"+strconv.Itoa(itemCount), func(b *testing.B) {
+			events := make(chan event.GenericEvent, itemCount)
+			r := &ReconcileConstraintTemplate{
+				Client:     &constraintListClient{Client: crfake.NewClientBuilder().Build(), items: items},
+				cstrEvents: events,
+			}
+			ct := &v1beta1.ConstraintTemplate{}
+			ct.Spec.CRD.Spec.Names.Kind = "TestKind"
+			status := &statusv1beta1.ConstraintTemplatePodStatus{}
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if err := r.triggerConstraintEvents(context.Background(), ct, status); err != nil {
+					b.Fatal(err)
+				}
+				for j := 0; j < itemCount; j++ {
+					<-events
+				}
+			}
+		})
+	}
+}
+
+func TestReconcile(t *testing.T) {
 	// Uncommenting the below enables logging of K8s internals like watch.
 	// fs := flag.NewFlagSet("", flag.PanicOnError)
 	// klog.InitFlags(fs)
@@ -129,68 +631,118 @@ violation[{"msg": "denied!"}] {
 
 	// Setup the Manager and Controller.  Wrap the Controller Reconcile function so it writes each request to a
 	// channel when it is finished.
-	mgr, wm := setupManager(t)
+	mgr, wm := testutils.SetupManager(t, cfg)
 	c := testclient.NewRetryClient(mgr.GetClient())
 
 	// creating the gatekeeper-system namespace is necessary because that's where
 	// status resources live by default
-	g.Expect(createGatekeeperNamespace(mgr.GetConfig())).NotTo(gomega.HaveOccurred())
-
-	// initialize OPA
-	driver := local.New(local.Tracing(true))
-	backend, err := opa.NewBackend(opa.Driver(driver))
+	err := testutils.CreateGatekeeperNamespace(mgr.GetConfig())
 	if err != nil {
-		t.Fatalf("unable to set up OPA backend: %s", err)
+		t.Fatal(err)
 	}
-	opa, err := backend.NewClient(opa.Targets(&target.K8sValidationTarget{}))
+
+	driver, err := rego.New(rego.Tracing(true))
 	if err != nil {
-		t.Fatalf("unable to set up OPA client: %s", err)
+		t.Fatalf("unable to set up Driver: %v", err)
+	}
+	// initialize K8sValidation
+	k8sDriver, err := k8scel.New()
+	if err != nil {
+		t.Fatalf("unable to set up K8s native driver: %v", err)
 	}
 
-	os.Setenv("POD_NAME", "no-pod")
-	podstatus.DisablePodOwnership()
-	cs := watch.NewSwitch()
-	tracker, err := readiness.SetupTracker(mgr, false)
-	g.Expect(err).NotTo(gomega.HaveOccurred())
-	pod := &corev1.Pod{}
-	pod.Name = "no-pod"
-	// events will be used to receive events from dynamic watches registered
-	events := make(chan event.GenericEvent, 1024)
-	rec, _ := newReconciler(mgr, opa, wm, cs, tracker, events, events, func() (*corev1.Pod, error) { return pod, nil })
-	g.Expect(add(mgr, rec)).NotTo(gomega.HaveOccurred())
-
-	cstr := newDenyAllCstr()
-
-	ctx, cancelFunc := context.WithCancel(context.Background())
-	mgrStopped := StartTestManager(ctx, mgr, g)
-	once := sync.Once{}
-	testMgrStopped := func() {
-		once.Do(func() {
-			cancelFunc()
-			mgrStopped.Wait()
-		})
+	cfClient, err := constraintclient.NewClient(constraintclient.Targets(&target.K8sValidationTarget{}), constraintclient.Driver(driver), constraintclient.Driver(k8sDriver), constraintclient.EnforcementPoints(util.AuditEnforcementPoint))
+	if err != nil {
+		t.Fatalf("unable to set up constraint framework client: %s", err)
 	}
 
-	defer testMgrStopped()
-	// Clean up to remove the crd, constraint and constraint template
-	defer func() {
-		crd := &apiextensionsv1.CustomResourceDefinition{}
-		g.Expect(c.Get(ctx, crdKey, crd)).NotTo(gomega.HaveOccurred())
+	testutils.Setenv(t, "POD_NAME", "no-pod")
 
-		g.Expect(deleteObject(ctx, c, cstr, timeout)).To(gomega.BeNil())
-		g.Expect(deleteObject(ctx, c, crd, timeout)).To(gomega.BeNil())
-		g.Expect(deleteObject(ctx, c, instance, timeout)).To(gomega.BeNil())
-	}()
+	tracker, err := readiness.SetupTracker(mgr, false, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	log.Info("Running test: CRD Gets Created")
+	pod := fakes.Pod(
+		fakes.WithNamespace("gatekeeper-system"),
+		fakes.WithName("no-pod"),
+	)
+
+	// constraintEvents for constraint controller, constraintTemplateEvents for webhook changes
+	constraintEvents := make(chan event.GenericEvent, 1024)
+	constraintTemplateEvents := make(chan event.GenericEvent, 1024)
+	processExcluder := process.Get()
+	processExcluder.Add(getMatchEntryConfig())
+
+	// Create webhook config cache for VAP operation tests
+	webhookCache := webhookconfigcache.NewWebhookConfigCache()
+
+	// Set up webhook configuration for VAP tests
+	const testWebhookName = "gatekeeper-validating-webhook-configuration"
+	webhookName := testWebhookName
+	originalVwhName := webhook.VwhName
+	defer func() { webhook.VwhName = originalVwhName }()
+	webhook.VwhName = &webhookName
+
+	exactMatch := admissionregistrationv1.Exact
+	webhookConfig := webhookconfigcache.WebhookMatchingConfig{
+		Rules: []admissionregistrationv1.RuleWithOperations{
+			{
+				Operations: []admissionregistrationv1.OperationType{
+					admissionregistrationv1.Create,
+					admissionregistrationv1.Update,
+					admissionregistrationv1.Delete,
+					admissionregistrationv1.Connect,
+				},
+				Rule: admissionregistrationv1.Rule{
+					APIGroups:   []string{""},
+					APIVersions: []string{"v1"},
+					Resources:   []string{"*"},
+				},
+			},
+		},
+		MatchPolicy: &exactMatch,
+	}
+	webhookCache.UpsertConfig(testWebhookName, webhookConfig)
+
+	// Make webhook cache available to tests for configuration
+	sharedWebhookCache := webhookCache
+	setVAPTestGlobals(t, &admissionregistrationv1beta1.SchemeGroupVersion)
+
+	rec, err := newReconciler(mgr, cfClient, wm, tracker, constraintEvents, constraintEvents, func(context.Context) (*corev1.Pod, error) { return pod, nil }, webhookCache, processExcluder)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = add(mgr, rec, constraintTemplateEvents)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	testutils.StartManager(ctx, t, mgr)
+
+	// Override the default VAPB generation wait time to speed up tests.
+	// The production default is 30s, but tests only need to verify the
+	// wait behavior works, not that it waits a specific duration.
+	origWait := constraint.GetDefaultWaitForVAPBGeneration()
+	constraint.SetDefaultWaitForVAPBGeneration(2)
+	t.Cleanup(func() { constraint.SetDefaultWaitForVAPBGeneration(origWait) })
+
 	t.Run("CRD Gets Created", func(t *testing.T) {
-		err = c.Create(ctx, instance)
-		g.Expect(err).NotTo(gomega.HaveOccurred())
+		suffix := "CRDGetsCreated"
+
+		logger.Info("Running test: CRD Gets Created")
+		constraintTemplate := makeReconcileConstraintTemplate(suffix)
+		t.Cleanup(testutils.DeleteObjectAndConfirm(ctx, t, c, expectedCRD(suffix)))
+		testutils.CreateThenCleanup(ctx, t, c, constraintTemplate)
 
 		clientset := kubernetes.NewForConfigOrDie(cfg)
-		g.Eventually(func() error {
+		err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+			return true
+		}, func() error {
 			crd := &apiextensionsv1.CustomResourceDefinition{}
-			if err := c.Get(ctx, crdKey, crd); err != nil {
+			if err := c.Get(ctx, crdKey(suffix), crd); err != nil {
 				return err
 			}
 			rs, err := clientset.Discovery().ServerResourcesForGroupVersion("constraints.gatekeeper.sh/v1beta1")
@@ -198,23 +750,1031 @@ violation[{"msg": "denied!"}] {
 				return err
 			}
 			for _, r := range rs.APIResources {
-				if r.Kind == "DenyAll" {
+				if r.Kind == DenyAll+suffix {
 					return nil
 				}
 			}
 			return errors.New("DenyAll not found")
-		}, timeout).Should(gomega.BeNil())
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		logger.Info("Running Test: vapb annotation should not be present on constraint template")
+		err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+			return true
+		}, func() error {
+			ct := &v1beta1.ConstraintTemplate{}
+			if err := c.Get(ctx, types.NamespacedName{Name: denyall + strings.ToLower(suffix)}, ct); err != nil {
+				return err
+			}
+			if _, ok := ct.GetAnnotations()[constraint.BlockVAPBGenerationUntilAnnotation]; ok {
+				return fmt.Errorf("unexpected %s annotations on CT", constraint.BlockVAPBGenerationUntilAnnotation)
+			}
+			if _, ok := ct.GetAnnotations()[constraint.VAPBGenerationAnnotation]; ok {
+				return fmt.Errorf("unexpected %s annotations on CT", constraint.VAPBGenerationAnnotation)
+			}
+			return nil
+		})
 	})
 
-	log.Info("Running test: Constraint is marked as enforced")
+	t.Run("Vap should be created with v1beta1", func(t *testing.T) {
+		suffix := "VapShouldBeCreatedV1Beta1"
+
+		logger.Info("Running test: Vap should be created with v1beta1")
+		constraintTemplate := makeReconcileConstraintTemplateForVap(suffix, ptr.To[bool](true), nil)
+		t.Cleanup(testutils.DeleteObjectAndConfirm(ctx, t, c, expectedCRD(suffix)))
+		transform.SetGroupVersion(&admissionregistrationv1beta1.SchemeGroupVersion)
+		testutils.CreateThenCleanup(ctx, t, c, constraintTemplate)
+
+		err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+			return true
+		}, func() error {
+			// check if vap resource exists now
+			vap := &admissionregistrationv1beta1.ValidatingAdmissionPolicy{}
+			vapName := fmt.Sprintf("gatekeeper-%s", denyall+strings.ToLower(suffix))
+			if err := c.Get(ctx, types.NamespacedName{Name: vapName}, vap); err != nil {
+				return err
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("Vap should not be created", func(t *testing.T) {
+		suffix := "VapShouldNotBeCreated"
+
+		logger.Info("Running test: Vap should not be created")
+		constraintTemplate := makeReconcileConstraintTemplateForVap(suffix, ptr.To[bool](false), nil)
+		t.Cleanup(testutils.DeleteObjectAndConfirm(ctx, t, c, expectedCRD(suffix)))
+		testutils.CreateThenCleanup(ctx, t, c, constraintTemplate)
+
+		err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+			return true
+		}, func() error {
+			// check if vap resource exists now
+			vap := &admissionregistrationv1beta1.ValidatingAdmissionPolicy{}
+			vapName := fmt.Sprintf("gatekeeper-%s", denyall+strings.ToLower(suffix))
+			if err := c.Get(ctx, types.NamespacedName{Name: vapName}, vap); err != nil {
+				if !apierrors.IsNotFound(err) {
+					return err
+				}
+				return nil
+			}
+			return fmt.Errorf("should result in error, vap not found")
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("Vap should not be created for rego only template", func(t *testing.T) {
+		suffix := "VapShouldNotBeCreatedForRegoOnlyTemplate"
+
+		logger.Info("Running test: Vap should not be created for rego only template")
+		constraintTemplate := makeReconcileConstraintTemplate(suffix)
+		t.Cleanup(testutils.DeleteObjectAndConfirm(ctx, t, c, expectedCRD(suffix)))
+		testutils.CreateThenCleanup(ctx, t, c, constraintTemplate)
+
+		err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+			return true
+		}, func() error {
+			// check if vap resource exists now
+			vap := &admissionregistrationv1beta1.ValidatingAdmissionPolicy{}
+			vapName := fmt.Sprintf("gatekeeper-%s", denyall+strings.ToLower(suffix))
+			if err := c.Get(ctx, types.NamespacedName{Name: vapName}, vap); err != nil {
+				if !apierrors.IsNotFound(err) {
+					return err
+				}
+				return nil
+			}
+			return fmt.Errorf("should result in error, vap not found")
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		logger.Info("Running test: EnforcementPointStatus should indicate missing CEL engine for constraint using VAP enforcementPoint with rego templates")
+		cstr := newDenyAllCstrWithScopedEA(suffix, util.VAPEnforcementPoint)
+		err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+			return true
+		}, func() error {
+			return c.Create(ctx, cstr)
+		})
+		if err != nil {
+			logger.Error(err, "create cstr")
+			t.Fatal(err)
+		}
+
+		err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+			return true
+		}, func() error {
+			statusObj := &statusv1beta1.ConstraintPodStatus{}
+			sName, err := statusv1beta1.KeyForConstraint(util.GetPodName(), cstr)
+			if err != nil {
+				return err
+			}
+			key := types.NamespacedName{Name: sName, Namespace: util.GetNamespace()}
+			if err := c.Get(ctx, key, statusObj); err != nil {
+				return err
+			}
+
+			for _, ep := range statusObj.Status.EnforcementPointsStatus {
+				if ep.EnforcementPoint == util.VAPEnforcementPoint {
+					if ep.Message == "" {
+						return fmt.Errorf("expected message")
+					}
+					if ep.State != constraint.ErrGenerateVAPBState {
+						return fmt.Errorf("expected error code")
+					}
+					return nil
+				}
+			}
+			return fmt.Errorf("expected enforcement point status")
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("Vap should not be created for only rego engine", func(t *testing.T) {
+		suffix := "VapShouldNotBeCreatedForOnlyRegoEngine"
+
+		logger.Info("Running test: Vap should not be created for only rego engine")
+		constraintTemplate := makeReconcileConstraintTemplateWithRegoEngine(suffix)
+		t.Cleanup(testutils.DeleteObjectAndConfirm(ctx, t, c, expectedCRD(suffix)))
+		testutils.CreateThenCleanup(ctx, t, c, constraintTemplate)
+
+		err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+			return true
+		}, func() error {
+			// check if vap resource exists now
+			vap := &admissionregistrationv1beta1.ValidatingAdmissionPolicy{}
+			vapName := fmt.Sprintf("gatekeeper-%s", denyall+strings.ToLower(suffix))
+			if err := c.Get(ctx, types.NamespacedName{Name: vapName}, vap); err != nil {
+				if !apierrors.IsNotFound(err) {
+					return err
+				}
+				return nil
+			}
+			return fmt.Errorf("should result in error, vap not found")
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("Vap should not be created without generateVAP", func(t *testing.T) {
+		suffix := "VapShouldNotBeCreatedWithoutGenerateVAP"
+
+		logger.Info("Running test: Vap should not be created without generateVAP")
+		constraintTemplate := makeReconcileConstraintTemplateForVap(suffix, nil, nil)
+		t.Cleanup(testutils.DeleteObjectAndConfirm(ctx, t, c, expectedCRD(suffix)))
+		testutils.CreateThenCleanup(ctx, t, c, constraintTemplate)
+
+		err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+			return true
+		}, func() error {
+			// check if vap resource exists now
+			vap := &admissionregistrationv1beta1.ValidatingAdmissionPolicy{}
+			vapName := fmt.Sprintf("gatekeeper-%s", denyall+strings.ToLower(suffix))
+			if err := c.Get(ctx, types.NamespacedName{Name: vapName}, vap); err != nil {
+				if !apierrors.IsNotFound(err) {
+					return err
+				}
+				return nil
+			}
+			return fmt.Errorf("should result in error, vap not found")
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("Vap should be created without generateVAP field", func(t *testing.T) {
+		suffix := "VapShouldBeCreatedWithoutGenerateVAP"
+		logger.Info("Running test: Vap should be created without generateVAP field")
+		constraintTemplate := makeReconcileConstraintTemplateForVap(suffix, nil, nil)
+		t.Cleanup(testutils.DeleteObjectAndConfirm(ctx, t, c, expectedCRD(suffix)))
+		testutils.CreateThenCleanup(ctx, t, c, constraintTemplate)
+
+		err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+			return true
+		}, func() error {
+			// check if vap resource exists now
+			vap := &admissionregistrationv1beta1.ValidatingAdmissionPolicy{}
+			vapName := fmt.Sprintf("gatekeeper-%s", denyall+strings.ToLower(suffix))
+			if err := c.Get(ctx, types.NamespacedName{Name: vapName}, vap); err != nil {
+				return err
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		logger.Info("Running test: constraint template should have vap generated status state set to generated")
+		err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+			return true
+		}, func() error {
+			statusObj := &statusv1beta1.ConstraintTemplatePodStatus{}
+			sName, err := statusv1beta1.KeyForConstraintTemplate(util.GetPodName(), constraintTemplate.GetName())
+			if err != nil {
+				return err
+			}
+			key := types.NamespacedName{Name: sName, Namespace: util.GetNamespace()}
+			if err := c.Get(ctx, key, statusObj); err != nil {
+				return err
+			}
+
+			if statusObj.Status.VAPGenerationStatus == nil || statusObj.Status.VAPGenerationStatus.State != GeneratedVAPState {
+				return fmt.Errorf("Expected VAP generation status state to be %s", GeneratedVAPState)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("VapBinding should not be created", func(t *testing.T) {
+		suffix := "VapBindingShouldNotBeCreated"
+		logger.Info("Running test: VapBinding should not be created")
+		origDefault := constraint.GetDefaultGenerateVAPB()
+		constraint.SetDefaultGenerateVAPB(false)
+		t.Cleanup(func() {
+			constraint.SetDefaultGenerateVAPB(origDefault)
+		})
+		constraintTemplate := makeReconcileConstraintTemplateForVap(suffix, ptr.To[bool](false), nil)
+		cstr := newDenyAllCstr(suffix)
+		t.Cleanup(testutils.DeleteObjectAndConfirm(ctx, t, c, expectedCRD(suffix)))
+		testutils.CreateThenCleanup(ctx, t, c, constraintTemplate)
+
+		err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+			return true
+		}, func() error {
+			return c.Create(ctx, cstr)
+		})
+		if err != nil {
+			logger.Error(err, "create cstr")
+			t.Fatal(err)
+		}
+		err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+			return true
+		}, func() error {
+			// check if vapbinding resource exists now
+			vapBinding := &admissionregistrationv1beta1.ValidatingAdmissionPolicyBinding{}
+			if err := c.Get(ctx, types.NamespacedName{Name: transform.GetVAPBindingName(cstr.GetKind(), cstr.GetName())}, vapBinding); err != nil {
+				if !apierrors.IsNotFound(err) {
+					return err
+				}
+				return nil
+			}
+			return fmt.Errorf("should result in error, vapbinding not found")
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("VapBinding should not be created with missing CEL", func(t *testing.T) {
+		suffix := "VapBindingShouldNotBeCreatedMissingCEL"
+		logger.Info("Running test: VapBinding should not be created with missing CEL")
+		constraintTemplate := makeReconcileConstraintTemplate(suffix)
+		cstr := newDenyAllCstr(suffix)
+		t.Cleanup(testutils.DeleteObjectAndConfirm(ctx, t, c, expectedCRD(suffix)))
+		testutils.CreateThenCleanup(ctx, t, c, constraintTemplate)
+
+		err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+			return true
+		}, func() error {
+			return c.Create(ctx, cstr)
+		})
+		if err != nil {
+			logger.Error(err, "create cstr")
+			t.Fatal(err)
+		}
+		err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+			return true
+		}, func() error {
+			// check if vapbinding resource exists now
+			vapBinding := &admissionregistrationv1beta1.ValidatingAdmissionPolicyBinding{}
+			if err := c.Get(ctx, types.NamespacedName{Name: transform.GetVAPBindingName(cstr.GetKind(), cstr.GetName())}, vapBinding); err != nil {
+				if !apierrors.IsNotFound(err) {
+					return err
+				}
+				return nil
+			}
+			return fmt.Errorf("should result in error, vapbinding not found")
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("Error should be present on constraint when VAP generation is off and VAPB generation is on for CEL templates", func(t *testing.T) {
+		suffix := "ErrorShouldBePresentOnConstraint"
+		logger.Info("Running test: Error should be present on constraint when VAP generation is off and VAPB generation is on")
+		constraintTemplate := makeReconcileConstraintTemplateForVap(suffix, ptr.To(false), nil)
+		cstr := newDenyAllCstr(suffix)
+		t.Cleanup(testutils.DeleteObjectAndConfirm(ctx, t, c, expectedCRD(suffix)))
+		testutils.CreateThenCleanup(ctx, t, c, constraintTemplate)
+
+		err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+			return true
+		}, func() error {
+			return c.Create(ctx, cstr)
+		})
+		if err != nil {
+			logger.Error(err, "create cstr")
+			t.Fatal(err)
+		}
+
+		err := isConstraintStatuErrorAsExpected(ctx, c, suffix, true, constraint.ErrVAPConditionsNotSatisfied.Error())
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("Error should not be present on constraint when VAP generation if off and VAPB generation is on for templates without CEL", func(t *testing.T) {
+		suffix := "ErrorShouldNotBePresentOnConstraint"
+		logger.Info("Running test: Error should not be present on constraint when VAP generation is off and VAPB generation is on for templates wihout CEL")
+		origDefault := constraint.GetDefaultGenerateVAP()
+		constraint.SetDefaultGenerateVAP(false)
+		t.Cleanup(func() {
+			constraint.SetDefaultGenerateVAP(origDefault)
+		})
+		constraintTemplate := makeReconcileConstraintTemplate(suffix)
+		cstr := newDenyAllCstr(suffix)
+		t.Cleanup(testutils.DeleteObjectAndConfirm(ctx, t, c, expectedCRD(suffix)))
+		testutils.CreateThenCleanup(ctx, t, c, constraintTemplate)
+		err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+			return true
+		}, func() error {
+			return c.Create(ctx, cstr)
+		})
+		if err != nil {
+			logger.Error(err, "create cstr")
+			t.Fatal(err)
+		}
+		err := isConstraintStatuErrorAsExpected(ctx, c, suffix, false, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("  be created without generateVap intent in CT", func(t *testing.T) {
+		suffix := "VapBindingShouldNotBeCreatedWithoutGenerateVapIntent"
+		logger.Info("Running test: VapBinding should not be created without generateVap intent in CT")
+		origDefault := constraint.GetDefaultGenerateVAPB()
+		constraint.SetDefaultGenerateVAPB(true)
+		t.Cleanup(func() { constraint.SetDefaultGenerateVAPB(origDefault) })
+		constraintTemplate := makeReconcileConstraintTemplateForVap(suffix, ptr.To[bool](false), nil)
+		cstr := newDenyAllCstr(suffix)
+		t.Cleanup(testutils.DeleteObjectAndConfirm(ctx, t, c, expectedCRD(suffix)))
+		testutils.CreateThenCleanup(ctx, t, c, constraintTemplate)
+
+		err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+			return true
+		}, func() error {
+			return c.Create(ctx, cstr)
+		})
+		if err != nil {
+			logger.Error(err, "create cstr")
+			t.Fatal(err)
+		}
+		err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+			return true
+		}, func() error {
+			vapBinding := &admissionregistrationv1beta1.ValidatingAdmissionPolicyBinding{}
+			if err := c.Get(ctx, types.NamespacedName{Name: transform.GetVAPBindingName(cstr.GetKind(), cstr.GetName())}, vapBinding); err != nil {
+				if !apierrors.IsNotFound(err) {
+					return err
+				}
+				return nil
+			}
+			return fmt.Errorf("should result in error, vapbinding not found")
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("VapBinding should be created with VAP enforcement point after default wait", func(t *testing.T) {
+		suffix := "VapBindingShouldBeCreatedWithVAPEnforcementPoint"
+		logger.Info("Running test: VapBinding should be created with VAP enforcement point after default wait")
+		constraintTemplate := makeReconcileConstraintTemplateForVap(suffix, ptr.To[bool](true), nil)
+		cstr := newDenyAllCstrWithScopedEA(suffix, util.VAPEnforcementPoint)
+		t.Cleanup(testutils.DeleteObjectAndConfirm(ctx, t, c, expectedCRD(suffix)))
+		testutils.CreateThenCleanup(ctx, t, c, constraintTemplate)
+
+		err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+			return true
+		}, func() error {
+			return c.Create(ctx, cstr)
+		})
+		if err != nil {
+			logger.Error(err, "create cstr")
+			t.Fatal(err)
+		}
+		err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+			return true
+		}, func() error {
+			ct := &v1beta1.ConstraintTemplate{}
+			if err := c.Get(ctx, types.NamespacedName{Name: denyall + strings.ToLower(suffix)}, ct); err != nil {
+				return err
+			}
+			timestamp := ct.GetAnnotations()[constraint.BlockVAPBGenerationUntilAnnotation]
+			if timestamp == "" {
+				return fmt.Errorf("expected %s annotations on CT", constraint.BlockVAPBGenerationUntilAnnotation)
+			}
+			if err := c.Get(ctx, types.NamespacedName{Name: cstr.GetName()}, cstr); err != nil {
+				return err
+			}
+			// check if vapbinding resource exists now
+			vapBinding := &admissionregistrationv1beta1.ValidatingAdmissionPolicyBinding{}
+			if err := c.Get(ctx, types.NamespacedName{Name: transform.GetVAPBindingName(cstr.GetKind(), cstr.GetName())}, vapBinding); err != nil {
+				// Since tests retries 3000 times at 100 retries per second, adding sleep makes sure that this test gets covarage time > 30s to cover the default wait.
+				time.Sleep(10 * time.Millisecond)
+				return err
+			}
+			blockTime, err := time.Parse(time.RFC3339, timestamp)
+			if err != nil {
+				return err
+			}
+			vapBindingCreationTime := vapBinding.GetCreationTimestamp().Time
+			if vapBindingCreationTime.Before(blockTime) {
+				return fmt.Errorf("VAPBinding should be created after default wait")
+			}
+			if ct.GetAnnotations()[constraint.VAPBGenerationAnnotation] != constraint.VAPBGenerationUnblocked {
+				return fmt.Errorf("expected %s annotations on CT to be unblocked", constraint.VAPBGenerationAnnotation)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("VapBinding should not be created without VAP enforcement Point", func(t *testing.T) {
+		suffix := "VapBShouldNotBeCreatedWithoutVAPEP"
+		logger.Info("Running test: VapBinding should not be created without VAP enforcement point")
+		constraintTemplate := makeReconcileConstraintTemplateForVap(suffix, ptr.To[bool](true), nil)
+		cstr := newDenyAllCstrWithScopedEA(suffix, util.AuditEnforcementPoint)
+		t.Cleanup(testutils.DeleteObjectAndConfirm(ctx, t, c, expectedCRD(suffix)))
+		testutils.CreateThenCleanup(ctx, t, c, constraintTemplate)
+
+		err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+			return true
+		}, func() error {
+			return c.Create(ctx, cstr)
+		})
+		if err != nil {
+			logger.Error(err, "create cstr")
+			t.Fatal(err)
+		}
+		err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+			return true
+		}, func() error {
+			// check if vapbinding resource exists now
+			vapBinding := &admissionregistrationv1beta1.ValidatingAdmissionPolicyBinding{}
+			if err := c.Get(ctx, types.NamespacedName{Name: transform.GetVAPBindingName(cstr.GetKind(), cstr.GetName())}, vapBinding); err != nil {
+				if !apierrors.IsNotFound(err) {
+					return err
+				}
+				return nil
+			}
+			return fmt.Errorf("should result in error, vapbinding not found")
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("Vap should be created with v1", func(t *testing.T) {
+		suffix := "VapShouldBeCreatedV1"
+
+		logger.Info("Running test: Vap should be created with v1")
+		transform.SetGroupVersion(&admissionregistrationv1.SchemeGroupVersion)
+		constraintTemplate := makeReconcileConstraintTemplateForVap(suffix, ptr.To[bool](true), nil)
+		t.Cleanup(testutils.DeleteObjectAndConfirm(ctx, t, c, expectedCRD(suffix)))
+		testutils.CreateThenCleanup(ctx, t, c, constraintTemplate)
+
+		err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+			return true
+		}, func() error {
+			// check if vap resource exists now
+			vap := &admissionregistrationv1.ValidatingAdmissionPolicy{}
+			vapName := fmt.Sprintf("gatekeeper-%s", denyall+strings.ToLower(suffix))
+			if err := c.Get(ctx, types.NamespacedName{Name: vapName}, vap); err != nil {
+				return err
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		logger.Info("Running test: VAP ConstraintTemplate should have VAPB annotation")
+		err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+			return true
+		}, func() error {
+			ct := &v1beta1.ConstraintTemplate{}
+			if err := c.Get(ctx, types.NamespacedName{Name: denyall + strings.ToLower(suffix)}, ct); err != nil {
+				return err
+			}
+			if ct.GetAnnotations()[constraint.BlockVAPBGenerationUntilAnnotation] == "" {
+				return fmt.Errorf("expected %s annotations on CT", constraint.BlockVAPBGenerationUntilAnnotation)
+			}
+			if ct.GetAnnotations()[constraint.VAPBGenerationAnnotation] == "" {
+				return fmt.Errorf("expected %s annotations on CT", constraint.VAPBGenerationAnnotation)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("VAP should be created with operations", func(t *testing.T) {
+		suffix := "VapShouldBeCreatedWithOps"
+
+		logger.Info("Running test: VAP should be created with operations")
+		globalTestMu.Lock()
+		defer globalTestMu.Unlock()
+
+		originalSyncVAPScope := *transform.SyncVAPScope
+		defer func() { *transform.SyncVAPScope = originalSyncVAPScope }()
+		*transform.SyncVAPScope = true
+
+		cache := webhookconfigcache.NewWebhookConfigCache()
+		const testWebhookName = "gatekeeper-validating-webhook-configuration"
+		webhookName := testWebhookName
+		originalVwhName := webhook.VwhName
+		defer func() { webhook.VwhName = originalVwhName }()
+		webhook.VwhName = &webhookName
+
+		exactMatch := admissionregistrationv1.Exact
+		webhookConfig := webhookconfigcache.WebhookMatchingConfig{
+			Rules: []admissionregistrationv1.RuleWithOperations{
+				{
+					Operations: []admissionregistrationv1.OperationType{
+						admissionregistrationv1.Create,
+						admissionregistrationv1.Update,
+					},
+					Rule: admissionregistrationv1.Rule{
+						APIGroups:   []string{""},
+						APIVersions: []string{"v1"},
+						Resources:   []string{"*"},
+					},
+				},
+			},
+			MatchPolicy: &exactMatch,
+		}
+		cache.UpsertConfig(webhookName, webhookConfig)
+
+		transform.SetGroupVersion(&admissionregistrationv1.SchemeGroupVersion)
+		ro := []admissionregistrationv1.OperationType{
+			admissionregistrationv1.Create,
+			admissionregistrationv1.Update,
+		}
+		constraintTemplate := makeReconcileConstraintTemplateForVap(suffix, ptr.To[bool](true), ro)
+		t.Cleanup(testutils.DeleteObjectAndConfirm(ctx, t, c, expectedCRD(suffix)))
+		testutils.CreateThenCleanup(ctx, t, c, constraintTemplate)
+		err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+			return true
+		}, func() error {
+			// check if vap resource exists now
+			vap := &admissionregistrationv1.ValidatingAdmissionPolicy{}
+			vapName := fmt.Sprintf("gatekeeper-%s", denyall+strings.ToLower(suffix))
+			if err := c.Get(ctx, types.NamespacedName{Name: vapName}, vap); err != nil {
+				return err
+			}
+			vapResourceRuleOps := vap.Spec.MatchConstraints.ResourceRules[0].Operations
+			if !sets.NewString(stringSliceFromOps(vapResourceRuleOps)...).Equal(sets.NewString(stringSliceFromOps(ro)...)) {
+				return fmt.Errorf("expected operations %v on VAP", ro)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("VAP should be created with wildcard operations", func(t *testing.T) {
+		suffix := "VapShouldBeCreatedWithWildcardOps"
+
+		logger.Info("Running test: VAP should be created with wildcard operations")
+		globalTestMu.Lock()
+		defer globalTestMu.Unlock()
+
+		originalSyncVAPScope := *transform.SyncVAPScope
+		defer func() { *transform.SyncVAPScope = originalSyncVAPScope }()
+		*transform.SyncVAPScope = true
+
+		cache := webhookconfigcache.NewWebhookConfigCache()
+		const testWebhookName = "gatekeeper-validating-webhook-configuration"
+		webhookName := testWebhookName
+		originalVwhName := webhook.VwhName
+		defer func() { webhook.VwhName = originalVwhName }()
+		webhook.VwhName = &webhookName
+
+		exactMatch := admissionregistrationv1.Exact
+		webhookConfig := webhookconfigcache.WebhookMatchingConfig{
+			Rules: []admissionregistrationv1.RuleWithOperations{
+				{
+					Operations: []admissionregistrationv1.OperationType{
+						admissionregistrationv1.Create,
+						admissionregistrationv1.Update,
+						admissionregistrationv1.Delete,
+						admissionregistrationv1.Connect,
+					},
+					Rule: admissionregistrationv1.Rule{
+						APIGroups:   []string{""},
+						APIVersions: []string{"v1"},
+						Resources:   []string{"*"},
+					},
+				},
+			},
+			MatchPolicy: &exactMatch,
+		}
+		cache.UpsertConfig(webhookName, webhookConfig)
+
+		transform.SetGroupVersion(&admissionregistrationv1.SchemeGroupVersion)
+		ro := []admissionregistrationv1.OperationType{
+			admissionregistrationv1.OperationAll,
+		}
+		constraintTemplate := makeReconcileConstraintTemplateForVap(suffix, ptr.To[bool](true), ro)
+		t.Cleanup(testutils.DeleteObjectAndConfirm(ctx, t, c, expectedCRD(suffix)))
+		testutils.CreateThenCleanup(ctx, t, c, constraintTemplate)
+		err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+			return true
+		}, func() error {
+			vap := &admissionregistrationv1.ValidatingAdmissionPolicy{}
+			vapName := fmt.Sprintf("gatekeeper-%s", denyall+strings.ToLower(suffix))
+			if err := c.Get(ctx, types.NamespacedName{Name: vapName}, vap); err != nil {
+				return err
+			}
+			vapResourceRuleOps := vap.Spec.MatchConstraints.ResourceRules[0].Operations
+			expectedOps := []admissionregistrationv1.OperationType{
+				admissionregistrationv1.Create, admissionregistrationv1.Update,
+				admissionregistrationv1.Delete, admissionregistrationv1.Connect,
+			}
+			if !sets.NewString(stringSliceFromOps(vapResourceRuleOps)...).Equal(sets.NewString(stringSliceFromOps(expectedOps)...)) {
+				return fmt.Errorf("expected wildcard operations to expand to %v, got %v", expectedOps, vapResourceRuleOps)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("VAP should be created with all individual operations", func(t *testing.T) {
+		suffix := "VapShouldBeCreatedWithAllOps"
+
+		logger.Info("Running test: VAP should be created with all individual operations")
+		globalTestMu.Lock()
+		defer globalTestMu.Unlock()
+
+		originalSyncVAPScope := *transform.SyncVAPScope
+		defer func() { *transform.SyncVAPScope = originalSyncVAPScope }()
+		*transform.SyncVAPScope = true
+
+		cache := webhookconfigcache.NewWebhookConfigCache()
+		const testWebhookName = "gatekeeper-validating-webhook-configuration"
+		webhookName := testWebhookName
+		originalVwhName := webhook.VwhName
+		defer func() { webhook.VwhName = originalVwhName }()
+		webhook.VwhName = &webhookName
+
+		exactMatch := admissionregistrationv1.Exact
+		webhookConfig := webhookconfigcache.WebhookMatchingConfig{
+			Rules: []admissionregistrationv1.RuleWithOperations{
+				{
+					Operations: []admissionregistrationv1.OperationType{
+						admissionregistrationv1.Create,
+						admissionregistrationv1.Update,
+						admissionregistrationv1.Delete,
+						admissionregistrationv1.Connect,
+					},
+					Rule: admissionregistrationv1.Rule{
+						APIGroups:   []string{""},
+						APIVersions: []string{"v1"},
+						Resources:   []string{"*"},
+					},
+				},
+			},
+			MatchPolicy: &exactMatch,
+		}
+		cache.UpsertConfig(webhookName, webhookConfig)
+
+		transform.SetGroupVersion(&admissionregistrationv1.SchemeGroupVersion)
+		ro := []admissionregistrationv1.OperationType{
+			admissionregistrationv1.Create,
+			admissionregistrationv1.Update,
+			admissionregistrationv1.Delete,
+			admissionregistrationv1.Connect,
+		}
+		constraintTemplate := makeReconcileConstraintTemplateForVap(suffix, ptr.To[bool](true), ro)
+		t.Cleanup(testutils.DeleteObjectAndConfirm(ctx, t, c, expectedCRD(suffix)))
+		testutils.CreateThenCleanup(ctx, t, c, constraintTemplate)
+		err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+			return true
+		}, func() error {
+			vap := &admissionregistrationv1.ValidatingAdmissionPolicy{}
+			vapName := fmt.Sprintf("gatekeeper-%s", denyall+strings.ToLower(suffix))
+			if err := c.Get(ctx, types.NamespacedName{Name: vapName}, vap); err != nil {
+				return err
+			}
+			vapResourceRuleOps := vap.Spec.MatchConstraints.ResourceRules[0].Operations
+			if !sets.NewString(stringSliceFromOps(vapResourceRuleOps)...).Equal(sets.NewString(stringSliceFromOps(ro)...)) {
+				return fmt.Errorf("expected operations %v on VAP", ro)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("VAP should be created with DELETE operation", func(t *testing.T) {
+		suffix := "VapShouldBeCreatedWithDeleteOp"
+
+		logger.Info("Running test: VAP should be created with DELETE operation")
+		globalTestMu.Lock()
+		defer globalTestMu.Unlock()
+
+		originalSyncVAPScope := *transform.SyncVAPScope
+		defer func() { *transform.SyncVAPScope = originalSyncVAPScope }()
+		*transform.SyncVAPScope = true
+
+		cache := webhookconfigcache.NewWebhookConfigCache()
+		const testWebhookName = "gatekeeper-validating-webhook-configuration"
+		webhookName := testWebhookName
+		originalVwhName := webhook.VwhName
+		defer func() { webhook.VwhName = originalVwhName }()
+		webhook.VwhName = &webhookName
+
+		exactMatch := admissionregistrationv1.Exact
+		webhookConfig := webhookconfigcache.WebhookMatchingConfig{
+			Rules: []admissionregistrationv1.RuleWithOperations{
+				{
+					Operations: []admissionregistrationv1.OperationType{
+						admissionregistrationv1.Delete,
+					},
+					Rule: admissionregistrationv1.Rule{
+						APIGroups:   []string{""},
+						APIVersions: []string{"v1"},
+						Resources:   []string{"*"},
+					},
+				},
+			},
+			MatchPolicy: &exactMatch,
+		}
+		cache.UpsertConfig(webhookName, webhookConfig)
+
+		transform.SetGroupVersion(&admissionregistrationv1.SchemeGroupVersion)
+		ro := []admissionregistrationv1.OperationType{
+			admissionregistrationv1.Delete,
+		}
+		constraintTemplate := makeReconcileConstraintTemplateForVap(suffix, ptr.To[bool](true), ro)
+		t.Cleanup(testutils.DeleteObjectAndConfirm(ctx, t, c, expectedCRD(suffix)))
+		testutils.CreateThenCleanup(ctx, t, c, constraintTemplate)
+		err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+			return true
+		}, func() error {
+			vap := &admissionregistrationv1.ValidatingAdmissionPolicy{}
+			vapName := fmt.Sprintf("gatekeeper-%s", denyall+strings.ToLower(suffix))
+			if err := c.Get(ctx, types.NamespacedName{Name: vapName}, vap); err != nil {
+				return err
+			}
+			vapResourceRuleOps := vap.Spec.MatchConstraints.ResourceRules[0].Operations
+			if !sets.NewString(stringSliceFromOps(vapResourceRuleOps)...).Equal(sets.NewString(stringSliceFromOps(ro)...)) {
+				return fmt.Errorf("expected operations %v on VAP", ro)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("VAP should be created with empty operations using webhook defaults", func(t *testing.T) {
+		suffix := "VapShouldBeCreatedWithEmptyOps"
+
+		logger.Info("Running test: VAP should be created with empty operations using webhook defaults")
+		globalTestMu.Lock()
+		defer globalTestMu.Unlock()
+
+		originalSyncVAPScope := *transform.SyncVAPScope
+		defer func() { *transform.SyncVAPScope = originalSyncVAPScope }()
+		*transform.SyncVAPScope = true
+		// Use the shared webhook cache instead of creating a new one
+		cache := sharedWebhookCache
+		const testWebhookName = "gatekeeper-validating-webhook-configuration"
+		webhookName := testWebhookName
+		originalVwhName := webhook.VwhName
+		defer func() { webhook.VwhName = originalVwhName }()
+		webhook.VwhName = &webhookName
+
+		exactMatch := admissionregistrationv1.Exact
+		webhookConfig := webhookconfigcache.WebhookMatchingConfig{
+			Rules: []admissionregistrationv1.RuleWithOperations{
+				{
+					Operations: []admissionregistrationv1.OperationType{
+						admissionregistrationv1.Delete,
+						admissionregistrationv1.Update,
+					},
+					Rule: admissionregistrationv1.Rule{
+						APIGroups:   []string{""},
+						APIVersions: []string{"v1"},
+						Resources:   []string{"*"},
+					},
+				},
+			},
+			MatchPolicy: &exactMatch,
+		}
+		cache.UpsertConfig(webhookName, webhookConfig)
+		ro := []admissionregistrationv1.OperationType{
+			admissionregistrationv1.Delete,
+			admissionregistrationv1.Update,
+		}
+
+		transform.SetGroupVersion(&admissionregistrationv1.SchemeGroupVersion)
+		constraintTemplate := makeReconcileConstraintTemplateForVap(suffix, ptr.To[bool](true), nil)
+		t.Cleanup(testutils.DeleteObjectAndConfirm(ctx, t, c, expectedCRD(suffix)))
+		testutils.CreateThenCleanup(ctx, t, c, constraintTemplate)
+		err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+			return true
+		}, func() error {
+			vap := &admissionregistrationv1.ValidatingAdmissionPolicy{}
+			vapName := fmt.Sprintf("gatekeeper-%s", denyall+strings.ToLower(suffix))
+			if err := c.Get(ctx, types.NamespacedName{Name: vapName}, vap); err != nil {
+				return err
+			}
+			if vap.Spec.MatchConstraints == nil || len(vap.Spec.MatchConstraints.ResourceRules) == 0 {
+				return fmt.Errorf("expected VAP to have resource rules")
+			}
+			vapResourceRuleOps := vap.Spec.MatchConstraints.ResourceRules[0].Operations
+			if !sets.NewString(stringSliceFromOps(vapResourceRuleOps)...).Equal(sets.NewString(stringSliceFromOps(ro)...)) {
+				return fmt.Errorf("expected operations %v on VAP", ro)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("VapBinding should be created with v1 with some delay after constraint CRD is available", func(t *testing.T) {
+		suffix := "VapBindingShouldBeCreatedV1"
+		logger.Info("Running test: VapBinding should be created with v1 with some delay after constraint CRD is available")
+		transform.SetGroupVersion(&admissionregistrationv1.SchemeGroupVersion)
+		constraintTemplate := makeReconcileConstraintTemplateForVap(suffix, ptr.To[bool](true), nil)
+		cstr := newDenyAllCstr(suffix)
+		t.Cleanup(testutils.DeleteObjectAndConfirm(ctx, t, c, expectedCRD(suffix)))
+		testutils.CreateThenCleanup(ctx, t, c, constraintTemplate)
+
+		err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+			return true
+		}, func() error {
+			return c.Create(ctx, cstr)
+		})
+		if err != nil {
+			logger.Error(err, "create cstr")
+			t.Fatal(err)
+		}
+		err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+			return true
+		}, func() error {
+			ct := &v1beta1.ConstraintTemplate{}
+			if err := c.Get(ctx, types.NamespacedName{Name: denyall + strings.ToLower(suffix)}, ct); err != nil {
+				return err
+			}
+			timestamp := ct.GetAnnotations()[constraint.BlockVAPBGenerationUntilAnnotation]
+			if timestamp == "" {
+				return fmt.Errorf("expected %s annotations on CT", constraint.BlockVAPBGenerationUntilAnnotation)
+			}
+			blockTime, err := time.Parse(time.RFC3339, timestamp)
+			if err != nil {
+				return err
+			}
+			// check if vapbinding resource exists now
+			vapBinding := &admissionregistrationv1.ValidatingAdmissionPolicyBinding{}
+			if err := c.Get(ctx, types.NamespacedName{Name: transform.GetVAPBindingName(cstr.GetKind(), cstr.GetName())}, vapBinding); err != nil {
+				// Since tests retries 3000 times at 100 retries per second, adding sleep makes sure that this test gets covarage time > 30s to cover the default wait.
+				time.Sleep(10 * time.Millisecond)
+				return err
+			}
+
+			vapBindingCreationTime := vapBinding.GetCreationTimestamp().Time
+			if vapBindingCreationTime.Before(blockTime) {
+				return fmt.Errorf("VAPBinding should not be created before the timestamp")
+			}
+			if ct.GetAnnotations()[constraint.VAPBGenerationAnnotation] != constraint.VAPBGenerationUnblocked {
+				return fmt.Errorf("expected %s annotations on CT to be unblocked", constraint.VAPBGenerationAnnotation)
+			}
+			if err := c.Delete(ctx, cstr); err != nil {
+				return err
+			}
+			return c.Delete(ctx, vapBinding)
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("VapBinding should be created with v1 without warnings in enforcementPointsStatus", func(t *testing.T) {
+		suffix := "VapBindingShouldBeCreatedV1EnforcementPointsStatus"
+		logger.Info("Running test: VapBinding should be created with v1 without warnings in enforcementPointsStatus")
+		transform.SetGroupVersion(&admissionregistrationv1.SchemeGroupVersion)
+		constraintTemplate := makeReconcileConstraintTemplateForVap(suffix, ptr.To[bool](true), nil)
+		cstr := newDenyAllCstr(suffix)
+		t.Cleanup(testutils.DeleteObjectAndConfirm(ctx, t, c, expectedCRD(suffix)))
+		testutils.CreateThenCleanup(ctx, t, c, constraintTemplate)
+
+		err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+			return true
+		}, func() error {
+			return c.Create(ctx, cstr)
+		})
+		if err != nil {
+			logger.Error(err, "create cstr")
+			t.Fatal(err)
+		}
+		err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+			return true
+		}, func() error {
+			statusObj := &statusv1beta1.ConstraintTemplatePodStatus{}
+			sName, err := statusv1beta1.KeyForConstraintTemplate(util.GetPodName(), constraintTemplate.GetName())
+			if err != nil {
+				return err
+			}
+			key := types.NamespacedName{Name: sName, Namespace: util.GetNamespace()}
+			if err := c.Get(ctx, key, statusObj); err != nil {
+				return err
+			}
+
+			if statusObj.Status.VAPGenerationStatus == nil || statusObj.Status.VAPGenerationStatus.State != GeneratedVAPState {
+				return fmt.Errorf("Expected VAP generation status state to be %s", GeneratedVAPState)
+			}
+
+			cStatusObj := &statusv1beta1.ConstraintPodStatus{}
+			name, err := statusv1beta1.KeyForConstraint(util.GetPodName(), cstr)
+			if err != nil {
+				return err
+			}
+			key = types.NamespacedName{Name: name, Namespace: util.GetNamespace()}
+			if err := c.Get(ctx, key, cStatusObj); err != nil {
+				return err
+			}
+
+			for _, ep := range cStatusObj.Status.EnforcementPointsStatus {
+				if ep.EnforcementPoint == util.VAPEnforcementPoint {
+					if ep.Message != "" {
+						return fmt.Errorf("message not expected")
+					}
+					if ep.State != constraint.GeneratedVAPBState {
+						return fmt.Errorf("expected state to be %s", constraint.GeneratedVAPBState)
+					}
+					break
+				}
+			}
+			return c.Delete(ctx, cstr)
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+
 	t.Run("Constraint is marked as enforced", func(t *testing.T) {
-		err = c.Create(ctx, cstr)
-		g.Expect(err).NotTo(gomega.HaveOccurred())
-		constraintEnforced(c, g, timeout)
-	})
+		suffix := "MarkedEnforced"
 
-	log.Info("Running test: Constraint actually enforced")
-	t.Run("Constraint actually enforced", func(t *testing.T) {
+		logger.Info("Running test: Constraint is marked as enforced")
+		constraintTemplate := makeReconcileConstraintTemplate(suffix)
+		cstr := newDenyAllCstr(suffix)
+
+		t.Cleanup(testutils.DeleteObjectAndConfirm(ctx, t, c, cstr))
+		t.Cleanup(testutils.DeleteObjectAndConfirm(ctx, t, c, expectedCRD(suffix)))
+		testutils.CreateThenCleanup(ctx, t, c, constraintTemplate)
+
+		err = retry.OnError(testutils.ConstantRetry, func(error) bool {
+			return true
+		}, func() error {
+			return c.Create(ctx, cstr)
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		err = constraintEnforced(ctx, c, suffix)
+		if err != nil {
+			t.Fatal(err)
+		}
+
 		ns := &corev1.Namespace{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: "testns",
@@ -230,60 +1790,293 @@ violation[{"msg": "denied!"}] {
 			Name:      "FooNamespace",
 			Object:    runtime.RawExtension{Object: ns},
 		}
-		resp, err := opa.Review(ctx, req)
-		g.Expect(err).NotTo(gomega.HaveOccurred())
-		if len(resp.Results()) != 1 {
-			fmt.Println(resp.TraceDump())
-			fmt.Println(opa.Dump(ctx))
+		resp, err := cfClient.Review(ctx, req, reviews.EnforcementPoint(util.AuditEnforcementPoint))
+		if err != nil {
+			t.Fatal(err)
 		}
-		g.Expect(len(resp.Results())).Should(gomega.Equal(1))
+
+		gotResults := resp.Results()
+		if len(gotResults) != 1 {
+			t.Log(resp.TraceDump())
+			t.Log(cfClient.Dump(ctx))
+			t.Fatalf("want 1 result, got %v", gotResults)
+		}
 	})
 
-	log.Info("Running test: Deleted constraint CRDs are recreated")
+	t.Run("Constraint with scoped enforcement actions is marked as enforced", func(t *testing.T) {
+		suffix := "ScopedMarkedEnforced"
+
+		logger.Info("Running test: Constraint with scoped enforcement actions is marked as enforced")
+		constraintTemplate := makeReconcileConstraintTemplate(suffix)
+		cstr := newDenyAllCstrWithScopedEA(suffix, util.AuditEnforcementPoint)
+
+		t.Cleanup(testutils.DeleteObjectAndConfirm(ctx, t, c, cstr))
+		t.Cleanup(testutils.DeleteObjectAndConfirm(ctx, t, c, expectedCRD(suffix)))
+		testutils.CreateThenCleanup(ctx, t, c, constraintTemplate)
+
+		err = retry.OnError(testutils.ConstantRetry, func(error) bool {
+			return true
+		}, func() error {
+			return c.Create(ctx, cstr)
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		err = constraintEnforced(ctx, c, suffix)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		ns := &corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "testns",
+			},
+		}
+		req := admissionv1.AdmissionRequest{
+			Kind: metav1.GroupVersionKind{
+				Group:   "",
+				Version: "v1",
+				Kind:    "Namespace",
+			},
+			Operation: "Create",
+			Name:      "FooNamespace",
+			Object:    runtime.RawExtension{Object: ns},
+		}
+		resp, err := cfClient.Review(ctx, req, reviews.EnforcementPoint(util.AuditEnforcementPoint))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		gotResults := resp.Results()
+		if len(gotResults) != 1 {
+			t.Log(resp.TraceDump())
+			t.Log(cfClient.Dump(ctx))
+			t.Fatalf("want 1 result, got %v", gotResults)
+		}
+	})
+
+	t.Run("Constraint with different ep than client and review should not be part of the review", func(t *testing.T) {
+		suffix := "ShouldNotBePartOfReview"
+
+		logger.Info("Running test: Constraint with different ep than client and review should not be part of the review")
+		constraintTemplate := makeReconcileConstraintTemplate(suffix)
+		cstr := newDenyAllCstrWithScopedEA(suffix, util.WebhookEnforcementPoint)
+
+		t.Cleanup(testutils.DeleteObjectAndConfirm(ctx, t, c, cstr))
+		t.Cleanup(testutils.DeleteObjectAndConfirm(ctx, t, c, expectedCRD(suffix)))
+		testutils.CreateThenCleanup(ctx, t, c, constraintTemplate)
+
+		err = retry.OnError(testutils.ConstantRetry, func(error) bool {
+			return true
+		}, func() error {
+			return c.Create(ctx, cstr)
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		err = constraintEnforced(ctx, c, suffix)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		ns := &corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "testns",
+			},
+		}
+		req := admissionv1.AdmissionRequest{
+			Kind: metav1.GroupVersionKind{
+				Group:   "",
+				Version: "v1",
+				Kind:    "Namespace",
+			},
+			Operation: "Create",
+			Name:      "FooNamespace",
+			Object:    runtime.RawExtension{Object: ns},
+		}
+		resp, err := cfClient.Review(ctx, req, reviews.EnforcementPoint(util.AuditEnforcementPoint))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		gotResults := resp.Results()
+		if len(gotResults) >= 1 {
+			t.Log(resp.TraceDump())
+			t.Log(cfClient.Dump(ctx))
+			t.Fatalf("want 0 result, got %v", gotResults)
+		}
+	})
+
+	t.Run("Review request initiated from an enforcement point not supported by client should result in error", func(t *testing.T) {
+		suffix := "ReviewResultsInError"
+
+		logger.Info("Running test: Review request initiated from an enforcement point not supported by client should result in error")
+		constraintTemplate := makeReconcileConstraintTemplate(suffix)
+		cstr := newDenyAllCstrWithScopedEA(suffix, util.WebhookEnforcementPoint)
+
+		t.Cleanup(testutils.DeleteObjectAndConfirm(ctx, t, c, cstr))
+		t.Cleanup(testutils.DeleteObjectAndConfirm(ctx, t, c, expectedCRD(suffix)))
+		testutils.CreateThenCleanup(ctx, t, c, constraintTemplate)
+
+		ns := &corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "testns",
+			},
+		}
+		req := admissionv1.AdmissionRequest{
+			Kind: metav1.GroupVersionKind{
+				Group:   "",
+				Version: "v1",
+				Kind:    "Namespace",
+			},
+			Operation: "Create",
+			Name:      "FooNamespace",
+			Object:    runtime.RawExtension{Object: ns},
+		}
+		_, err := cfClient.Review(ctx, req, reviews.EnforcementPoint(util.WebhookEnforcementPoint))
+		if err == nil {
+			t.Fatal("want error enforcement point is not supported by client, got nil")
+		}
+	})
+
+	t.Run("Constraint With invalid enforcement point should get error in status", func(t *testing.T) {
+		suffix := "InvalidEnforcementPoint"
+
+		logger.Info("Running test: Constraint With invalid enforcement point should get error in status")
+		constraintTemplate := makeReconcileConstraintTemplate(suffix)
+		cstr := newDenyAllCstrWithScopedEA(suffix, "invalid")
+		t.Cleanup(testutils.DeleteObjectAndConfirm(ctx, t, c, cstr))
+		t.Cleanup(testutils.DeleteObjectAndConfirm(ctx, t, c, expectedCRD(suffix)))
+		testutils.CreateThenCleanup(ctx, t, c, constraintTemplate)
+
+		err = retry.OnError(testutils.ConstantRetry, func(error) bool {
+			return true
+		}, func() error {
+			return c.Create(ctx, cstr)
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		err = retry.OnError(testutils.ConstantRetry, func(error) bool {
+			return true
+		}, func() error {
+			err := c.Get(ctx, types.NamespacedName{Name: fmt.Sprintf("cstr-%s", strings.ToLower(suffix))}, cstr)
+			if err != nil {
+				return err
+			}
+			status, err := getCByPodStatus(cstr)
+			if err != nil {
+				return err
+			}
+
+			errorReported := false
+			for _, e := range status.Errors {
+				if strings.Contains(e.Message, "unrecognized enforcement points") {
+					errorReported = true
+					break
+				}
+			}
+			if !errorReported {
+				return fmt.Errorf("want error in constraint status, got %+v", status)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+
 	t.Run("Deleted constraint CRDs are recreated", func(t *testing.T) {
-		crd := &apiextensionsv1.CustomResourceDefinition{}
-		g.Expect(c.Get(ctx, crdKey, crd)).NotTo(gomega.HaveOccurred())
+		suffix := "CRDRecreated"
+
+		logger.Info("Running test: Deleted constraint CRDs are recreated")
+		// Clean up to remove the crd, constraint and constraint template
+		constraintTemplate := makeReconcileConstraintTemplate(suffix)
+		cstr := newDenyAllCstr(suffix)
+
+		t.Cleanup(testutils.DeleteObjectAndConfirm(ctx, t, c, cstr))
+		t.Cleanup(testutils.DeleteObjectAndConfirm(ctx, t, c, expectedCRD(suffix)))
+		testutils.CreateThenCleanup(ctx, t, c, constraintTemplate)
+
+		var crd *apiextensionsv1.CustomResourceDefinition
+		err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+			return true
+		}, func() error {
+			crd = &apiextensionsv1.CustomResourceDefinition{}
+			return c.Get(ctx, crdKey(suffix), crd)
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
 		origUID := crd.GetUID()
 		crd.Spec = apiextensionsv1.CustomResourceDefinitionSpec{}
-		g.Expect(c.Delete(ctx, crd)).NotTo(gomega.HaveOccurred())
+		err = c.Delete(ctx, crd)
+		if err != nil {
+			t.Fatal(err)
+		}
 
-		g.Eventually(func() error {
+		err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+			return true
+		}, func() error {
 			crd := &apiextensionsv1.CustomResourceDefinition{}
-			if err := c.Get(ctx, crdKey, crd); err != nil {
+			if err := c.Get(ctx, crdKey(suffix), crd); err != nil {
 				return err
 			}
 			if !crd.GetDeletionTimestamp().IsZero() {
-				return errors.New("Still deleting")
+				return errors.New("still deleting")
 			}
 			if crd.GetUID() == origUID {
-				return errors.New("Not yet deleted")
+				return errors.New("not yet deleted")
 			}
 			for _, cond := range crd.Status.Conditions {
 				if cond.Type == apiextensionsv1.Established && cond.Status == apiextensionsv1.ConditionTrue {
 					return nil
 				}
 			}
-			return errors.New("Not established")
-		}, timeout, time.Second).Should(gomega.BeNil())
+			return errors.New("not established")
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
 
-		g.Eventually(func() error {
-			sList := &podstatus.ConstraintPodStatusList{}
+		err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+			return true
+		}, func() error {
+			sList := &statusv1beta1.ConstraintPodStatusList{}
 			if err := c.List(ctx, sList); err != nil {
 				return err
 			}
 			if len(sList.Items) != 0 {
-				return fmt.Errorf("Remaining status items: %+v", sList.Items)
+				return fmt.Errorf("remaining status items: %+v", sList.Items)
 			}
 			return nil
-		}, timeout).Should(gomega.BeNil())
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
 
-		g.Eventually(func() error { return c.Create(ctx, newDenyAllCstr()) }, timeout).Should(gomega.BeNil())
+		err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+			return true
+		}, func() error {
+			return c.Create(ctx, newDenyAllCstr(suffix))
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
 		// we need a longer timeout because deleting the CRD interrupts the watch
-		constraintEnforced(c, g, 50*timeout)
+		err = constraintEnforced(ctx, c, suffix)
+		if err != nil {
+			t.Fatal(err)
+		}
 	})
 
-	log.Info("Running test: Templates with Invalid Rego throw errors")
 	t.Run("Templates with Invalid Rego throw errors", func(t *testing.T) {
+		logger.Info("Running test: Templates with Invalid Rego throw errors")
 		// Create template with invalid rego, should populate parse error in status
 		instanceInvalidRego := &v1beta1.ConstraintTemplate{
 			ObjectMeta: metav1.ObjectMeta{Name: "invalidrego"},
@@ -297,7 +2090,7 @@ violation[{"msg": "denied!"}] {
 				},
 				Targets: []v1beta1.Target{
 					{
-						Target: "admission.k8s.gatekeeper.sh",
+						Target: target.Name,
 						Rego: `
 	package foo
 
@@ -305,47 +2098,63 @@ violation[{"msg": "denied!"}] {
 
 	anyrule[}}}//invalid//rego
 
-	`},
+	`,
+					},
 				},
 			},
 		}
 
 		err = c.Create(ctx, instanceInvalidRego)
-		g.Expect(err).NotTo(gomega.HaveOccurred())
-		defer func() {
-			err = c.Delete(ctx, instanceInvalidRego)
-			g.Expect(err).NotTo(gomega.HaveOccurred())
-		}()
+		if err != nil {
+			t.Fatal(err)
+		}
 
-		g.Eventually(func() error {
+		// TODO: Test if this removal is necessary.
+		// https://github.com/open-policy-agent/gatekeeper/pull/1595#discussion_r722819552
+		t.Cleanup(testutils.DeleteObject(t, c, instanceInvalidRego))
+
+		err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+			return true
+		}, func() error {
 			ct := &v1beta1.ConstraintTemplate{}
 			if err := c.Get(ctx, types.NamespacedName{Name: "invalidrego"}, ct); err != nil {
 				return err
 			}
-			if ct.Name == "invalidrego" {
-				status, found := getCTByPodStatus(ct)
-				if !found {
-					return fmt.Errorf("could not retrieve CT status for pod, byPod status: %+v", ct.Status.ByPod)
-				}
-				if len(status.Errors) == 0 {
-					j, err := json.Marshal(status)
-					if err != nil {
-						t.Fatal("could not parse JSON", err)
-					}
-					s := string(j)
-					return fmt.Errorf("InvalidRego template should contain an error: %s", s)
-				}
-				if status.Errors[0].Code != "rego_parse_error" {
-					return fmt.Errorf("InvalidRego template returning unexpected error %s", status.Errors[0].Code)
-				}
-				return nil
+
+			if ct.Name != "invalidrego" {
+				return errors.New("InvalidRego not found")
 			}
-			return errors.New("InvalidRego not found")
-		}, timeout).Should(gomega.BeNil())
+
+			status, found := getCTByPodStatus(ct)
+			if !found {
+				return fmt.Errorf("could not retrieve CT status for pod, byPod status: %+v", ct.Status.ByPod)
+			}
+
+			if len(status.Errors) == 0 {
+				j, err := json.Marshal(status)
+				if err != nil {
+					t.Fatal("could not parse JSON", err)
+				}
+				s := string(j)
+				return fmt.Errorf("InvalidRego template should contain an error: %q", s)
+			}
+
+			if status.Errors[0].Code != ErrIngestCode {
+				return fmt.Errorf("InvalidRego template returning unexpected error %q, got error %+v",
+					status.Errors[0].Code, status.Errors)
+			}
+
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
 	})
 
-	log.Info("Running test: Deleted constraint templates not enforced")
 	t.Run("Deleted constraint templates not enforced", func(t *testing.T) {
+		suffix := "DeletedNotEnforced"
+
+		logger.Info("Running test: Deleted constraint templates not enforced")
 		ns := &corev1.Namespace{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: "testns",
@@ -361,125 +2170,1278 @@ violation[{"msg": "denied!"}] {
 			Name:      "FooNamespace",
 			Object:    runtime.RawExtension{Object: ns},
 		}
-		resp, err := opa.Review(ctx, req)
-		g.Expect(err).NotTo(gomega.HaveOccurred())
-		if len(resp.Results()) != 1 {
-			fmt.Println(resp.TraceDump())
-			fmt.Println(opa.Dump(ctx))
+		resp, err := cfClient.Review(ctx, req, reviews.EnforcementPoint(util.AuditEnforcementPoint))
+		if err != nil {
+			t.Fatal(err)
 		}
-		g.Expect(len(resp.Results())).Should(gomega.Equal(1))
-		g.Expect(c.Delete(ctx, instance.DeepCopy())).Should(gomega.BeNil())
-		g.Eventually(func() error {
-			resp, err := opa.Review(ctx, req)
+
+		gotResults := resp.Results()
+		if len(resp.Results()) != 0 {
+			t.Log(resp.TraceDump())
+			t.Log(cfClient.Dump(ctx))
+			t.Fatalf("did not get 0 results: %v", gotResults)
+		}
+
+		constraintTemplate := makeReconcileConstraintTemplate(suffix)
+		err = c.Delete(ctx, constraintTemplate)
+		if err != nil && !apierrors.IsNotFound(err) {
+			t.Fatal(err)
+		}
+
+		err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+			return true
+		}, func() error {
+			resp, err := cfClient.Review(ctx, req, reviews.EnforcementPoint(util.AuditEnforcementPoint))
 			if err != nil {
 				return err
 			}
 			if len(resp.Results()) != 0 {
-				dump, _ := opa.Dump(ctx)
-				return fmt.Errorf("Results not yet zero\nOPA DUMP:\n%s", dump)
+				dump, _ := cfClient.Dump(ctx)
+				return fmt.Errorf("Results not yet zero\nDUMP:\n%s", dump)
 			}
 			return nil
-		}, timeout).Should(gomega.BeNil())
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
 	})
+}
+
+func TestPersistPodStatus(t *testing.T) {
+	tests := []struct {
+		name        string
+		change      bool
+		writeErr    error
+		wantUpdates int
+		wantErr     bool
+	}{
+		{name: "unchanged"},
+		{name: "changed", change: true, wantUpdates: 1},
+		{name: "update error", change: true, writeErr: errors.New("update error"), wantUpdates: 1, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			status := &statusv1beta1.ConstraintTemplatePodStatus{
+				Status: statusv1beta1.ConstraintTemplatePodStatusStatus{ID: "test-pod"},
+			}
+			oldStatus := status.Status.DeepCopy()
+			if tt.change {
+				status.Status.ObservedGeneration = 1
+			}
+			trackingClient := &statusTrackingClient{writeErr: tt.writeErr}
+			r := &ReconcileConstraintTemplate{Client: trackingClient}
+
+			err := r.persistPodStatus(context.Background(), status, oldStatus)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("persistPodStatus() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if trackingClient.updates != tt.wantUpdates {
+				t.Fatalf("expected %d updates, got %d", tt.wantUpdates, trackingClient.updates)
+			}
+		})
+	}
+
+	t.Run("recomputed error", func(t *testing.T) {
+		testErr := errors.New("validatingAdmissionPolicy API is not enabled")
+		status := &statusv1beta1.ConstraintTemplatePodStatus{
+			Status: statusv1beta1.ConstraintTemplatePodStatusStatus{
+				Errors: []*v1beta1.CreateCRDError{{
+					Code:    ErrCreateCode,
+					Message: fmt.Sprintf("ValidatingAdmissionPolicy resource cannot be generated for ConstraintTemplate: %s", testErr),
+				}},
+			},
+		}
+		oldStatus := status.Status.DeepCopy()
+		status.Status.Errors = nil
+		trackingClient := &statusTrackingClient{}
+		r := &ReconcileConstraintTemplate{Client: trackingClient}
+
+		if err := r.reportErrorOnCTStatus(context.Background(), ErrCreateCode, "ValidatingAdmissionPolicy resource cannot be generated for ConstraintTemplate", status, testErr); !errors.Is(err, testErr) {
+			t.Fatalf("expected original error %v, got %v", testErr, err)
+		}
+		if err := r.persistPodStatus(context.Background(), status, oldStatus); err != nil {
+			t.Fatalf("persistPodStatus() error = %v", err)
+		}
+		if trackingClient.updates != 0 {
+			t.Fatalf("expected recomputed status to skip update, got %d", trackingClient.updates)
+		}
+	})
+}
+
+func TestReconcileRawErrorPreservesPodStatus(t *testing.T) {
+	ct := makeReconcileConstraintTemplate("RawError")
+	ct.SetUID("template-uid")
+	ct.SetGeneration(2)
+	status := &statusv1beta1.ConstraintTemplatePodStatus{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-pod-" + ct.GetName(),
+			Namespace: util.GetNamespace(),
+		},
+		Status: statusv1beta1.ConstraintTemplatePodStatusStatus{
+			ID:                 "test-pod",
+			TemplateUID:        ct.GetUID(),
+			ObservedGeneration: 1,
+			Errors: []*v1beta1.CreateCRDError{{
+				Code:    ErrCreateCode,
+				Message: "existing error",
+			}},
+		},
+	}
+	r, trackingClient := newUnitReconciler(t, ct, status)
+	getErr := errors.New("get CRD")
+	trackingClient.crdGetErr = getErr
+
+	_, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: types.NamespacedName{Name: ct.GetName()}})
+	if !errors.Is(err, getErr) {
+		t.Fatalf("expected CRD get error %v, got %v", getErr, err)
+	}
+	if trackingClient.statusUpdates != 0 {
+		t.Fatalf("expected raw error to skip status update, got %d", trackingClient.statusUpdates)
+	}
+
+	stored := &statusv1beta1.ConstraintTemplatePodStatus{}
+	require.NoError(t, trackingClient.Client.Get(context.Background(), client.ObjectKeyFromObject(status), stored))
+	if len(stored.Status.Errors) != 1 || stored.Status.Errors[0].Message != "existing error" {
+		t.Fatalf("expected existing status error to be preserved, got %v", stored.Status.Errors)
+	}
+}
+
+func TestReconcileStableReportedErrorSkipsStatusUpdate(t *testing.T) {
+	ct := makeReconcileConstraintTemplate("StableError")
+	ct.Spec.Targets[0].Rego = `
+package foo
+
+violation[{"msg": "denied"}] { 1 == 1 }
+invalid[}}
+`
+	r, trackingClient := newUnitReconciler(t, ct)
+	request := reconcile.Request{NamespacedName: types.NamespacedName{Name: ct.GetName()}}
+
+	firstResult, firstErr := r.Reconcile(context.Background(), request)
+	if firstErr == nil {
+		t.Fatal("expected invalid Rego reconcile error")
+	}
+	if firstResult != (reconcile.Result{}) {
+		t.Fatalf("expected empty result for invalid Rego, got %v", firstResult)
+	}
+	if trackingClient.statusCreates != 1 {
+		t.Fatalf("expected one immediate status create, got %d", trackingClient.statusCreates)
+	}
+	if trackingClient.statusUpdates != 1 {
+		t.Fatalf("expected first reconcile to persist one status update, got %d", trackingClient.statusUpdates)
+	}
+
+	trackingClient.statusUpdates = 0
+	secondResult, secondErr := r.Reconcile(context.Background(), request)
+	if firstResult != secondResult {
+		t.Fatalf("expected stable reconcile result %v, got %v", firstResult, secondResult)
+	}
+	if (firstErr == nil) != (secondErr == nil) {
+		t.Fatalf("expected stable reconcile error, got first=%v second=%v", firstErr, secondErr)
+	}
+	if firstErr.Error() != secondErr.Error() {
+		t.Fatalf("expected stable reconcile error %q, got %q", firstErr, secondErr)
+	}
+	if trackingClient.statusUpdates != 0 {
+		t.Fatalf("expected identical reported error to skip status update, got %d", trackingClient.statusUpdates)
+	}
+
+	statusName, err := statusv1beta1.KeyForConstraintTemplate("test-pod", ct.GetName())
+	require.NoError(t, err)
+	stored := &statusv1beta1.ConstraintTemplatePodStatus{}
+	require.NoError(t, trackingClient.Client.Get(context.Background(), types.NamespacedName{Name: statusName, Namespace: util.GetNamespace()}, stored))
+	if len(stored.Status.Errors) != 1 {
+		t.Fatalf("expected one persisted error, got %v", stored.Status.Errors)
+	}
+}
+
+func TestReconcileStatusCreateErrorIsReturned(t *testing.T) {
+	ct := makeReconcileConstraintTemplate("CreateError")
+	r, trackingClient := newUnitReconciler(t, ct)
+	statusName, err := statusv1beta1.KeyForConstraintTemplate("test-pod", ct.GetName())
+	require.NoError(t, err)
+	createErr := apierrors.NewAlreadyExists(schema.GroupResource{Group: statusv1beta1.GroupVersion.Group, Resource: "constrainttemplatepodstatuses"}, statusName)
+	trackingClient.statusCreateErr = createErr
+
+	result, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: types.NamespacedName{Name: ct.GetName()}})
+	if !apierrors.IsAlreadyExists(err) {
+		t.Fatalf("expected status create error %v, got %v", createErr, err)
+	}
+	if result != (reconcile.Result{}) {
+		t.Fatalf("expected empty result for status create error, got %v", result)
+	}
+	if trackingClient.statusCreates != 1 || trackingClient.statusUpdates != 0 {
+		t.Fatalf("expected one create and no updates, got %d creates and %d updates", trackingClient.statusCreates, trackingClient.statusUpdates)
+	}
+}
+
+func TestReconcileStatusUpdateErrorPreservesRequeueBehavior(t *testing.T) {
+	ct := makeReconcileConstraintTemplate("UpdateError")
+	ct.Spec.Targets[0].Target = "unknown.target"
+	r, trackingClient := newUnitReconciler(t, ct)
+	updateErr := apierrors.NewConflict(schema.GroupResource{Group: statusv1beta1.GroupVersion.Group, Resource: "constrainttemplatepodstatuses"}, ct.GetName(), errors.New("conflict"))
+	trackingClient.statusUpdateErr = updateErr
+
+	result, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: types.NamespacedName{Name: ct.GetName()}})
+	if err != nil {
+		t.Fatalf("expected status update failure to preserve nil error, got %v", err)
+	}
+	if result != (reconcile.Result{Requeue: true}) {
+		t.Fatalf("expected explicit requeue for status update failure, got %v", result)
+	}
+	if trackingClient.statusCreates != 1 || trackingClient.statusUpdates != 1 {
+		t.Fatalf("expected one create and one update attempt, got %d creates and %d updates", trackingClient.statusCreates, trackingClient.statusUpdates)
+	}
+}
+
+func TestReconcilePreservesBothReconcileAndStatusErrors(t *testing.T) {
+	ct := makeReconcileConstraintTemplate("CombinedError")
+	ct.SetUID("template-uid")
+	r, trackingClient := newUnitReconciler(t, ct)
+
+	unversionedCT := &templates.ConstraintTemplate{}
+	require.NoError(t, r.scheme.Convert(ct, unversionedCT, nil))
+	unversionedCRD, err := r.cfClient.CreateCRD(context.Background(), unversionedCT)
+	require.NoError(t, err)
+	currentCRD := &apiextensionsv1.CustomResourceDefinition{}
+	require.NoError(t, r.scheme.Convert(unversionedCRD, currentCRD, nil))
+	require.NoError(t, trackingClient.Client.Create(context.Background(), currentCRD))
+
+	reconcileErr := errors.New("update CRD")
+	persistErr := apierrors.NewConflict(schema.GroupResource{Group: statusv1beta1.GroupVersion.Group, Resource: "constrainttemplatepodstatuses"}, ct.GetName(), errors.New("conflict"))
+	trackingClient.crdUpdateErr = reconcileErr
+	trackingClient.statusUpdateErr = persistErr
+
+	result, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: types.NamespacedName{Name: ct.GetName()}})
+	if result != (reconcile.Result{}) {
+		t.Fatalf("expected empty result for combined error, got %v", result)
+	}
+	if !errors.Is(err, reconcileErr) {
+		t.Fatalf("expected combined error to preserve reconcile error %v, got %v", reconcileErr, err)
+	}
+	if !errors.Is(err, persistErr) {
+		t.Fatalf("expected combined error to preserve status error %v, got %v", persistErr, err)
+	}
+	wantMessage := fmt.Sprintf("Could not update status: %s: %s", persistErr, reconcileErr)
+	if err.Error() != wantMessage {
+		t.Fatalf("expected unchanged combined error message %q, got %q", wantMessage, err)
+	}
+	if trackingClient.statusCreates != 1 || trackingClient.statusUpdates != 1 {
+		t.Fatalf("expected one create and one update attempt, got %d creates and %d updates", trackingClient.statusCreates, trackingClient.statusUpdates)
+	}
+}
+
+func TestManageVAP_VAPAPIDisabledPreservesRetry(t *testing.T) {
+	transform.SetVapAPIEnabled(ptr.To(false))
+	transform.SetGroupVersion(nil)
+	t.Cleanup(func() {
+		transform.SetVapAPIEnabled(nil)
+		transform.SetGroupVersion(nil)
+	})
+
+	ct := makeReconcileConstraintTemplateForVap("VAPAPIDisabled", ptr.To(true), nil)
+	scheme := runtime.NewScheme()
+	require.NoError(t, v1beta1.AddToScheme(scheme))
+	unversionedCT := &templates.ConstraintTemplate{}
+	require.NoError(t, scheme.Convert(ct, unversionedCT, nil))
+
+	status := &statusv1beta1.ConstraintTemplatePodStatus{}
+	trackingClient := &statusTrackingClient{}
+	r := &ReconcileConstraintTemplate{
+		Client:  trackingClient,
+		metrics: &reporter{vapRegistry: metrics.NewVAPStatusRegistry()},
+	}
+
+	err := r.manageVAP(context.Background(), ct, unversionedCT, status, logger, true)
+	if !errors.Is(err, constraint.ErrValidatingAdmissionPolicyAPIDisabled) {
+		t.Fatalf("expected unavailable API error, got %v", err)
+	}
+	if len(status.Status.Errors) != 1 {
+		t.Fatalf("expected one status error, got %d", len(status.Status.Errors))
+	}
+	if got := status.Status.Errors[0].Message; !strings.Contains(got, constraint.ErrValidatingAdmissionPolicyAPIDisabled.Error()) {
+		t.Fatalf("expected unavailable API status error, got %q", got)
+	}
+	if trackingClient.updates != 0 || trackingClient.creates != 0 {
+		t.Fatalf("expected manageVAP to leave persistence to Reconcile, got %d creates and %d updates", trackingClient.creates, trackingClient.updates)
+	}
+}
+
+func TestManageVAP_PreservesPolicyUntilWebhookScopeIsAvailable(t *testing.T) {
+	for _, groupVersion := range []schema.GroupVersion{admissionregistrationv1.SchemeGroupVersion, admissionregistrationv1beta1.SchemeGroupVersion} {
+		t.Run(groupVersion.Version, func(t *testing.T) {
+			globalTestMu.Lock()
+			defer globalTestMu.Unlock()
+			originalSyncVAPScope := *transform.SyncVAPScope
+			originalVwhName := webhook.VwhName
+			t.Cleanup(func() {
+				*transform.SyncVAPScope = originalSyncVAPScope
+				webhook.VwhName = originalVwhName
+			})
+			*transform.SyncVAPScope = true
+			setVAPTestGlobals(t, &groupVersion)
+
+			ct := makeReconcileConstraintTemplateForVap("ScopeRecovery", ptr.To(true), nil)
+			ct.UID = types.UID("template-uid")
+			r, _ := newUnitReconciler(t, ct)
+			require.NoError(t, admissionregistrationv1.AddToScheme(r.scheme))
+			require.NoError(t, admissionregistrationv1beta1.AddToScheme(r.scheme))
+			r.webhookCache = webhookconfigcache.NewWebhookConfigCache()
+			unversionedCT := &templates.ConstraintTemplate{}
+			require.NoError(t, r.scheme.Convert(ct, unversionedCT, nil))
+			selector := &metav1.LabelSelector{
+				MatchLabels: map[string]string{"environment": "production"},
+				MatchExpressions: []metav1.LabelSelectorRequirement{{
+					Key: "admission.gatekeeper.sh/ignore", Operator: metav1.LabelSelectorOpDoesNotExist,
+				}},
+			}
+			existing, err := vapForVersion(&groupVersion)
+			require.NoError(t, err)
+			existing.SetName(getVAPName(ct.Name))
+			existing.SetUID(types.UID("policy-uid"))
+			switch policy := existing.(type) {
+			case *admissionregistrationv1.ValidatingAdmissionPolicy:
+				policy.Spec.MatchConstraints = &admissionregistrationv1.MatchResources{NamespaceSelector: selector}
+			case *admissionregistrationv1beta1.ValidatingAdmissionPolicy:
+				policy.Spec.MatchConstraints = &admissionregistrationv1beta1.MatchResources{NamespaceSelector: selector}
+			}
+			require.NoError(t, r.Create(context.Background(), existing))
+			before := existing.DeepCopyObject()
+			status := &statusv1beta1.ConstraintTemplatePodStatus{}
+
+			err = r.manageVAP(context.Background(), ct, unversionedCT, status, logr.Discard(), true)
+			require.ErrorContains(t, err, "is not available for VAP scope synchronization")
+			require.Len(t, status.Status.Errors, 1)
+			after, err := vapForVersion(&groupVersion)
+			require.NoError(t, err)
+			require.NoError(t, r.Get(context.Background(), client.ObjectKeyFromObject(existing), after))
+			require.Equal(t, before, after)
+
+			r.webhookCache.UpsertConfig(*webhook.VwhName, webhookconfigcache.WebhookMatchingConfig{
+				NamespaceSelector: selector,
+				Rules: []admissionregistrationv1.RuleWithOperations{{
+					Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Create},
+					Rule:       admissionregistrationv1.Rule{APIGroups: []string{"*"}, APIVersions: []string{"*"}, Resources: []string{"*"}},
+				}},
+			})
+			require.NoError(t, r.manageVAP(context.Background(), ct, unversionedCT, status, logr.Discard(), true))
+			require.NoError(t, r.Get(context.Background(), client.ObjectKeyFromObject(existing), after))
+			require.Equal(t, existing.GetUID(), after.GetUID())
+			require.NotEqual(t, before, after)
+			require.Equal(t, GeneratedVAPState, status.Status.VAPGenerationStatus.State)
+			switch policy := after.(type) {
+			case *admissionregistrationv1.ValidatingAdmissionPolicy:
+				require.Equal(t, selector, policy.Spec.MatchConstraints.NamespaceSelector)
+			case *admissionregistrationv1beta1.ValidatingAdmissionPolicy:
+				require.Equal(t, selector, policy.Spec.MatchConstraints.NamespaceSelector)
+			}
+
+			webhook.VwhName = ptr.To("")
+			require.NoError(t, r.manageVAP(context.Background(), ct, unversionedCT, status, logr.Discard(), true))
+			after, err = vapForVersion(&groupVersion)
+			require.NoError(t, err)
+			require.NoError(t, r.Get(context.Background(), client.ObjectKeyFromObject(existing), after))
+			require.Equal(t, existing.GetUID(), after.GetUID())
+			switch policy := after.(type) {
+			case *admissionregistrationv1.ValidatingAdmissionPolicy:
+				require.Nil(t, policy.Spec.MatchConstraints.NamespaceSelector)
+				require.Len(t, policy.Spec.MatchConstraints.ResourceRules, 1)
+			case *admissionregistrationv1beta1.ValidatingAdmissionPolicy:
+				require.Nil(t, policy.Spec.MatchConstraints.NamespaceSelector)
+				require.Len(t, policy.Spec.MatchConstraints.ResourceRules, 1)
+			}
+		})
+	}
+}
+
+func TestManageVAP_RefreshesExistingSharedPolicy(t *testing.T) {
+	for _, groupVersion := range []schema.GroupVersion{admissionregistrationv1.SchemeGroupVersion, admissionregistrationv1beta1.SchemeGroupVersion} {
+		t.Run(groupVersion.Version, func(t *testing.T) {
+			setVAPTestGlobals(t, &groupVersion)
+			originalMode := constraint.GetVAPGenerationMode()
+			require.NoError(t, constraint.SetVAPGenerationMode(constraint.VAPGenerationModeTemplate))
+			t.Cleanup(func() { require.NoError(t, constraint.SetVAPGenerationMode(originalMode)) })
+			ct := makeReconcileConstraintTemplateForVap("Refresh", ptr.To(true), nil)
+			ct.SetUID("current-template")
+			ct.SetGeneration(2)
+			scheme := runtime.NewScheme()
+			require.NoError(t, v1beta1.AddToScheme(scheme))
+			require.NoError(t, admissionregistrationv1.AddToScheme(scheme))
+			require.NoError(t, admissionregistrationv1beta1.AddToScheme(scheme))
+			unversioned := &templates.ConstraintTemplate{}
+			require.NoError(t, scheme.Convert(ct, unversioned, nil))
+			webhookCache := webhookconfigcache.NewWebhookConfigCache()
+			webhookCache.UpsertConfig(*webhook.VwhName, webhookconfigcache.WebhookMatchingConfig{
+				Rules: []admissionregistrationv1.RuleWithOperations{{
+					Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Create, admissionregistrationv1.Update},
+					Rule:       admissionregistrationv1.Rule{APIGroups: []string{"*"}, APIVersions: []string{"*"}, Resources: []string{"*"}},
+				}},
+			})
+			reconciler := &ReconcileConstraintTemplate{scheme: scheme, metrics: newStatsReporter(), webhookCache: webhookCache}
+			desired, err := reconciler.transformTemplateToVAP(unversioned, getVAPName(ct.GetName()), logger)
+			require.NoError(t, err)
+			stale := desired.DeepCopy()
+			stale.Spec.Validations[0].Expression = "false"
+			current, err := getRunTimeVAP(&groupVersion, stale, nil)
+			require.NoError(t, err)
+			current.SetUID("shared-policy")
+			current.SetResourceVersion("1")
+			require.NoError(t, controllerutil.SetControllerReference(ct, current, scheme))
+			baseClient := crfake.NewClientBuilder().WithScheme(scheme).WithObjects(current).Build()
+			reconciler.Client = baseClient
+			reconciler.apiReader = baseClient
+			status := &statusv1beta1.ConstraintTemplatePodStatus{}
+			require.NoError(t, reconciler.manageVAP(context.Background(), ct, unversioned, status, logger, true))
+			stored, err := vapForVersion(&groupVersion)
+			require.NoError(t, err)
+			require.NoError(t, baseClient.Get(context.Background(), client.ObjectKeyFromObject(current), stored))
+			switch policy := stored.(type) {
+			case *admissionregistrationv1.ValidatingAdmissionPolicy:
+				require.Equal(t, desired.Spec.Validations[0].Expression, policy.Spec.Validations[0].Expression)
+			case *admissionregistrationv1beta1.ValidatingAdmissionPolicy:
+				require.Equal(t, desired.Spec.Validations[0].Expression, policy.Spec.Validations[0].Expression)
+			default:
+				t.Fatalf("unexpected policy %T", stored)
+			}
+			require.Equal(t, current.GetUID(), stored.GetUID())
+			require.NotEqual(t, current.GetResourceVersion(), stored.GetResourceVersion())
+			require.True(t, metav1.IsControlledBy(stored, ct))
+			require.Equal(t, ct.GetGeneration(), status.Status.VAPGenerationStatus.ObservedGeneration)
+		})
+	}
+}
+
+func TestManageVAP_PerConstraintModeDoesNotCreateTemplateVAP(t *testing.T) {
+	setConstraintVAPGenerationMode(t)
+	setVAPTestGlobals(t, &admissionregistrationv1.SchemeGroupVersion)
+
+	ct := makeReconcileConstraintTemplateForVap("PerConstraint", ptr.To(true), nil)
+	ct.SetUID("template-uid")
+	unversionedCT := &templates.ConstraintTemplate{}
+	scheme := runtime.NewScheme()
+	require.NoError(t, v1beta1.AddToScheme(scheme))
+	require.NoError(t, admissionregistrationv1.AddToScheme(scheme))
+	require.NoError(t, scheme.Convert(ct, unversionedCT, nil))
+
+	baseClient := crfake.NewClientBuilder().WithScheme(scheme).Build()
+	r := &ReconcileConstraintTemplate{
+		Client:    baseClient,
+		apiReader: baseClient,
+		scheme:    scheme,
+		metrics:   newStatsReporter(),
+	}
+	r.vapCleanup = newTemplateVAPCleanup(r, admissionregistrationv1.SchemeGroupVersion)
+	t.Cleanup(r.vapCleanup.queue.ShutDown)
+	status := &statusv1beta1.ConstraintTemplatePodStatus{
+		Status: statusv1beta1.ConstraintTemplatePodStatusStatus{
+			VAPGenerationStatus: &statusv1beta1.VAPGenerationStatus{State: GeneratedVAPState},
+		},
+	}
+	require.NoError(t, r.manageVAP(context.Background(), ct, unversionedCT, status, logger, true))
+
+	policy := &admissionregistrationv1.ValidatingAdmissionPolicy{}
+	err := baseClient.Get(context.Background(), types.NamespacedName{Name: getVAPName(ct.GetName())}, policy)
+	require.True(t, apierrors.IsNotFound(err))
+	require.Nil(t, status.Status.VAPGenerationStatus)
+}
+
+func TestManageVAP_PerConstraintModeRetainsReferencedTemplateVAP(t *testing.T) {
+	setConstraintVAPGenerationMode(t)
+	setVAPTestGlobals(t, &admissionregistrationv1.SchemeGroupVersion)
+
+	ct, unversionedCT, policy, scheme := makeTemplateVAPObjects(t)
+	binding := &admissionregistrationv1.ValidatingAdmissionPolicyBinding{
+		ObjectMeta: metav1.ObjectMeta{Name: "binding"},
+		Spec: admissionregistrationv1.ValidatingAdmissionPolicyBindingSpec{
+			PolicyName: policy.GetName(),
+		},
+	}
+	cachedClient := crfake.NewClientBuilder().WithScheme(scheme).WithObjects(policy.DeepCopy()).WithIndex(&admissionregistrationv1.ValidatingAdmissionPolicyBinding{}, vapBindingPolicyNameField, vapBindingPolicyNames).Build()
+	apiReader := crfake.NewClientBuilder().WithScheme(scheme).WithObjects(ct, policy, binding).Build()
+	r := &ReconcileConstraintTemplate{Client: cachedClient, apiReader: apiReader, scheme: scheme, metrics: newStatsReporter()}
+	r.vapCleanup = newTemplateVAPCleanup(r, admissionregistrationv1.SchemeGroupVersion)
+	t.Cleanup(r.vapCleanup.queue.ShutDown)
+	require.NoError(t, r.manageVAP(context.Background(), ct, unversionedCT, &statusv1beta1.ConstraintTemplatePodStatus{}, logger, true))
+	r.vapCleanup.processNextBatch(context.Background())
+
+	require.NoError(t, cachedClient.Get(context.Background(), client.ObjectKeyFromObject(policy), &admissionregistrationv1.ValidatingAdmissionPolicy{}))
+}
+
+func TestManageVAP_PerConstraintModeDeletesUnreferencedTemplateVAP(t *testing.T) {
+	setConstraintVAPGenerationMode(t)
+	setVAPTestGlobals(t, &admissionregistrationv1.SchemeGroupVersion)
+
+	ct, unversionedCT, policy, scheme := makeTemplateVAPObjects(t)
+	baseClient := crfake.NewClientBuilder().WithScheme(scheme).WithObjects(ct, policy).WithIndex(&admissionregistrationv1.ValidatingAdmissionPolicyBinding{}, vapBindingPolicyNameField, vapBindingPolicyNames).Build()
+	r := &ReconcileConstraintTemplate{Client: baseClient, apiReader: baseClient, scheme: scheme, metrics: newStatsReporter()}
+	r.vapCleanup = newTemplateVAPCleanup(r, admissionregistrationv1.SchemeGroupVersion)
+	t.Cleanup(r.vapCleanup.queue.ShutDown)
+	require.NoError(t, r.manageVAP(context.Background(), ct, unversionedCT, &statusv1beta1.ConstraintTemplatePodStatus{}, logger, true))
+	require.NoError(t, baseClient.Get(context.Background(), client.ObjectKeyFromObject(policy), &admissionregistrationv1.ValidatingAdmissionPolicy{}))
+	r.vapCleanup.processNextBatch(context.Background())
+
+	err := baseClient.Get(context.Background(), client.ObjectKeyFromObject(policy), &admissionregistrationv1.ValidatingAdmissionPolicy{})
+	require.True(t, apierrors.IsNotFound(err))
+}
+
+type recordingDeleteClient struct {
+	client.Client
+	options []client.DeleteOptions
+}
+
+func (recorder *recordingDeleteClient) Delete(ctx context.Context, object client.Object, options ...client.DeleteOption) error {
+	deleteOptions := client.DeleteOptions{}
+	deleteOptions.ApplyOptions(options)
+	recorder.options = append(recorder.options, deleteOptions)
+	return recorder.Client.Delete(ctx, object, options...)
+}
+
+func TestDeleteTemplateVAPPreservesReplacement(t *testing.T) {
+	const unchanged = "unchanged"
+	for _, groupVersion := range []schema.GroupVersion{admissionregistrationv1.SchemeGroupVersion, admissionregistrationv1beta1.SchemeGroupVersion} {
+		for _, changed := range []string{"replacement", "ownership", unchanged} {
+			t.Run(fmt.Sprintf("%s/%s", groupVersion.Version, changed), func(t *testing.T) {
+				template, _, policy, scheme := makeTemplateVAPObjects(t)
+				require.NoError(t, admissionregistrationv1beta1.AddToScheme(scheme))
+				cached, err := vapForVersion(&groupVersion)
+				require.NoError(t, err)
+				cached.SetName(policy.GetName())
+				cached.SetUID("original-policy")
+				cached.SetResourceVersion("1")
+				cached.SetOwnerReferences(policy.GetOwnerReferences())
+				live, ok := cached.DeepCopyObject().(client.Object)
+				require.True(t, ok)
+				if changed != unchanged {
+					live.SetResourceVersion("2")
+					owners := live.GetOwnerReferences()
+					owners[0].UID = "new-template"
+					live.SetOwnerReferences(owners)
+				}
+				if changed == "replacement" {
+					live.SetUID("replacement-policy")
+				}
+				baseClient := crfake.NewClientBuilder().WithScheme(scheme).WithObjects(live).Build()
+				recorder := &recordingDeleteClient{Client: baseClient}
+				reconciler := &ReconcileConstraintTemplate{Client: recorder}
+				err = reconciler.deleteVAPIfOwned(context.Background(), cached, template)
+				if changed == unchanged {
+					require.NoError(t, err)
+				} else {
+					require.True(t, apierrors.IsConflict(err), "expected delete precondition conflict: %v", err)
+				}
+				require.Len(t, recorder.options, 1)
+				preconditions := recorder.options[0].Preconditions
+				require.NotNil(t, preconditions)
+				require.Equal(t, ptr.To(cached.GetUID()), preconditions.UID)
+				require.Equal(t, ptr.To(cached.GetResourceVersion()), preconditions.ResourceVersion)
+				stored, ok := live.DeepCopyObject().(client.Object)
+				require.True(t, ok)
+				getErr := baseClient.Get(context.Background(), client.ObjectKeyFromObject(live), stored)
+				if changed == unchanged {
+					require.True(t, apierrors.IsNotFound(getErr))
+					return
+				}
+				require.NoError(t, getErr)
+				require.NoError(t, reconciler.deleteVAPIfOwned(context.Background(), stored, template))
+				require.Len(t, recorder.options, 1, "retry must skip a new owner's policy")
+			})
+		}
+	}
+}
+
+func TestVAPReferencedByBinding(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, admissionregistrationv1.AddToScheme(scheme))
+	require.NoError(t, admissionregistrationv1beta1.AddToScheme(scheme))
+	objects := []client.Object{
+		&admissionregistrationv1.ValidatingAdmissionPolicyBinding{
+			ObjectMeta: metav1.ObjectMeta{Name: "v1-binding"},
+			Spec: admissionregistrationv1.ValidatingAdmissionPolicyBindingSpec{
+				PolicyName: "v1-policy",
+			},
+		},
+		&admissionregistrationv1beta1.ValidatingAdmissionPolicyBinding{
+			ObjectMeta: metav1.ObjectMeta{Name: "v1beta1-binding"},
+			Spec: admissionregistrationv1beta1.ValidatingAdmissionPolicyBindingSpec{
+				PolicyName: "v1beta1-policy",
+			},
+		},
+	}
+	baseClient := crfake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).
+		WithIndex(&admissionregistrationv1.ValidatingAdmissionPolicyBinding{}, vapBindingPolicyNameField, vapBindingPolicyNames).
+		WithIndex(&admissionregistrationv1beta1.ValidatingAdmissionPolicyBinding{}, vapBindingPolicyNameField, vapBindingPolicyNames).Build()
+	r := &ReconcileConstraintTemplate{Client: baseClient, apiReader: baseClient}
+
+	tests := []struct {
+		name         string
+		groupVersion *schema.GroupVersion
+		policyName   string
+		want         bool
+	}{
+		{name: "v1 referenced", groupVersion: &admissionregistrationv1.SchemeGroupVersion, policyName: "v1-policy", want: true},
+		{name: "v1 unreferenced", groupVersion: &admissionregistrationv1.SchemeGroupVersion, policyName: "other", want: false},
+		{name: "v1beta1 referenced", groupVersion: &admissionregistrationv1beta1.SchemeGroupVersion, policyName: "v1beta1-policy", want: true},
+		{name: "v1beta1 unreferenced", groupVersion: &admissionregistrationv1beta1.SchemeGroupVersion, policyName: "other", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := r.vapsReferencedByBindings(context.Background(), tt.groupVersion, []string{tt.policyName})
+			require.NoError(t, err)
+			require.Equal(t, tt.want, got.Has(tt.policyName))
+		})
+	}
+}
+
+type vapBindingListClient struct {
+	client.Client
+	listCalls   int
+	listErr     error
+	listOptions client.ListOptions
+	listPage    func(client.ObjectList, client.ListOptions) error
+}
+
+func (reader *vapBindingListClient) List(ctx context.Context, list client.ObjectList, options ...client.ListOption) error {
+	reader.listCalls++
+	reader.listOptions = *(&client.ListOptions{}).ApplyOptions(options)
+	if reader.listErr != nil {
+		return reader.listErr
+	}
+	if reader.listPage != nil {
+		return reader.listPage(list, reader.listOptions)
+	}
+	return reader.Client.List(ctx, list, options...)
+}
+
+func TestVAPReferencedByBindingCacheSafety(t *testing.T) {
+	for _, groupVersion := range []schema.GroupVersion{admissionregistrationv1.SchemeGroupVersion, admissionregistrationv1beta1.SchemeGroupVersion} {
+		for _, scenario := range []struct {
+			name            string
+			cachedReference bool
+			liveReference   bool
+			cacheError      bool
+			apiError        bool
+			want            bool
+			wantAPILists    int
+		}{
+			{name: "cached reference", cachedReference: true, liveReference: true, want: true},
+			{name: "cache missing reference", liveReference: true, want: true, wantAPILists: 1},
+			{name: "stale cached reference", cachedReference: true, want: true},
+			{name: "unreferenced", wantAPILists: 1},
+			{name: "cache error", cacheError: true},
+			{name: "API error", apiError: true, wantAPILists: 1},
+		} {
+			t.Run(groupVersion.Version+"/"+scenario.name, func(t *testing.T) {
+				scheme := runtime.NewScheme()
+				require.NoError(t, admissionregistrationv1.AddToScheme(scheme))
+				require.NoError(t, admissionregistrationv1beta1.AddToScheme(scheme))
+				prototype, err := vapBindingForVersion(&groupVersion)
+				require.NoError(t, err)
+				newBinding := func(policyName string) client.Object {
+					binding, ok := prototype.DeepCopyObject().(client.Object)
+					require.True(t, ok)
+					binding.SetName(policyName + "-binding")
+					switch typed := binding.(type) {
+					case *admissionregistrationv1.ValidatingAdmissionPolicyBinding:
+						typed.Spec.PolicyName = policyName
+					case *admissionregistrationv1beta1.ValidatingAdmissionPolicyBinding:
+						typed.Spec.PolicyName = policyName
+					}
+					return binding
+				}
+				cachedObjects := []client.Object{newBinding("unrelated")}
+				liveObjects := []client.Object{newBinding("unrelated")}
+				if scenario.cachedReference {
+					cachedObjects = append(cachedObjects, newBinding("wanted"))
+				}
+				if scenario.liveReference {
+					liveObjects = append(liveObjects, newBinding("wanted"))
+				}
+				cached := &vapBindingListClient{Client: crfake.NewClientBuilder().WithScheme(scheme).WithObjects(cachedObjects...).WithIndex(prototype, vapBindingPolicyNameField, vapBindingPolicyNames).Build()}
+				live := &vapBindingListClient{Client: crfake.NewClientBuilder().WithScheme(scheme).WithObjects(liveObjects...).Build()}
+				if scenario.cacheError {
+					cached.listErr = errors.New("cache read failed")
+				}
+				if scenario.apiError {
+					live.listErr = errors.New("API read failed")
+				}
+				reconciler := &ReconcileConstraintTemplate{Client: cached, apiReader: live}
+				got, err := reconciler.vapsReferencedByBindings(context.Background(), &groupVersion, []string{"wanted"})
+				require.Equal(t, scenario.cacheError || scenario.apiError, err != nil)
+				require.Equal(t, scenario.want, got.Has("wanted"))
+				require.Equal(t, 1, cached.listCalls)
+				require.Equal(t, scenario.wantAPILists, live.listCalls)
+				require.NotNil(t, cached.listOptions.FieldSelector)
+				require.Equal(t, "spec.policyName=wanted", cached.listOptions.FieldSelector.String())
+				require.Nil(t, live.listOptions.FieldSelector)
+			})
+		}
+	}
+}
+
+func TestVAPReferencedByBindingPagination(t *testing.T) {
+	for _, groupVersion := range []schema.GroupVersion{admissionregistrationv1.SchemeGroupVersion, admissionregistrationv1beta1.SchemeGroupVersion} {
+		for _, scenario := range []string{"later reference", "unreferenced", "page error"} {
+			t.Run(groupVersion.Version+"/"+scenario, func(t *testing.T) {
+				scheme := runtime.NewScheme()
+				require.NoError(t, admissionregistrationv1.AddToScheme(scheme))
+				require.NoError(t, admissionregistrationv1beta1.AddToScheme(scheme))
+				prototype, err := vapBindingForVersion(&groupVersion)
+				require.NoError(t, err)
+				cached := crfake.NewClientBuilder().WithScheme(scheme).WithIndex(prototype, vapBindingPolicyNameField, vapBindingPolicyNames).Build()
+				live := &vapBindingListClient{}
+				live.listPage = func(list client.ObjectList, options client.ListOptions) error {
+					require.Nil(t, options.FieldSelector)
+					require.EqualValues(t, vapBindingListPageSize, options.Limit)
+					policyName, next := "unrelated", "next-page"
+					if live.listCalls == 1 {
+						require.Empty(t, options.Continue)
+					} else {
+						require.Equal(t, 2, live.listCalls)
+						require.Equal(t, "next-page", options.Continue)
+						if scenario == "page error" {
+							return errors.New("page read failed")
+						}
+						next = ""
+						if scenario == "later reference" {
+							policyName = "wanted"
+						}
+					}
+					switch typed := list.(type) {
+					case *admissionregistrationv1.ValidatingAdmissionPolicyBindingList:
+						typed.Items = []admissionregistrationv1.ValidatingAdmissionPolicyBinding{{Spec: admissionregistrationv1.ValidatingAdmissionPolicyBindingSpec{PolicyName: policyName}}}
+						typed.SetContinue(next)
+					case *admissionregistrationv1beta1.ValidatingAdmissionPolicyBindingList:
+						typed.Items = []admissionregistrationv1beta1.ValidatingAdmissionPolicyBinding{{Spec: admissionregistrationv1beta1.ValidatingAdmissionPolicyBindingSpec{PolicyName: policyName}}}
+						typed.SetContinue(next)
+					default:
+						t.Fatalf("unexpected binding list %T", list)
+					}
+					return nil
+				}
+				reconciler := &ReconcileConstraintTemplate{Client: cached, apiReader: live}
+				got, err := reconciler.vapsReferencedByBindings(context.Background(), &groupVersion, []string{"wanted"})
+				require.Equal(t, scenario == "page error", err != nil)
+				require.Equal(t, scenario == "later reference", got.Has("wanted"))
+				require.Equal(t, 2, live.listCalls)
+			})
+		}
+	}
+}
+
+func TestVAPReferencesShareOneScan(t *testing.T) {
+	for _, groupVersion := range []schema.GroupVersion{admissionregistrationv1.SchemeGroupVersion, admissionregistrationv1beta1.SchemeGroupVersion} {
+		t.Run(groupVersion.Version, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			require.NoError(t, admissionregistrationv1.AddToScheme(scheme))
+			require.NoError(t, admissionregistrationv1beta1.AddToScheme(scheme))
+			prototype, err := vapBindingForVersion(&groupVersion)
+			require.NoError(t, err)
+			cached := crfake.NewClientBuilder().WithScheme(scheme).WithIndex(prototype, vapBindingPolicyNameField, vapBindingPolicyNames).Build()
+			live := &vapBindingListClient{}
+			live.listPage = func(list client.ObjectList, options client.ListOptions) error {
+				require.Nil(t, options.FieldSelector)
+				require.EqualValues(t, vapBindingListPageSize, options.Limit)
+				policyName, next := "first", "second-page"
+				if live.listCalls == 2 {
+					require.Equal(t, "second-page", options.Continue)
+					policyName, next = "last", ""
+				}
+				switch typed := list.(type) {
+				case *admissionregistrationv1.ValidatingAdmissionPolicyBindingList:
+					typed.Items = []admissionregistrationv1.ValidatingAdmissionPolicyBinding{{Spec: admissionregistrationv1.ValidatingAdmissionPolicyBindingSpec{PolicyName: policyName}}}
+				case *admissionregistrationv1beta1.ValidatingAdmissionPolicyBindingList:
+					typed.Items = []admissionregistrationv1beta1.ValidatingAdmissionPolicyBinding{{Spec: admissionregistrationv1beta1.ValidatingAdmissionPolicyBindingSpec{PolicyName: policyName}}}
+				}
+				list.SetContinue(next)
+				return nil
+			}
+			reconciler := &ReconcileConstraintTemplate{Client: cached, apiReader: live}
+			policies := []string{"first", "last"}
+			for index := 0; index < 50; index++ {
+				policies = append(policies, fmt.Sprintf("unreferenced-%d", index))
+			}
+			references, err := reconciler.vapsReferencedByBindings(context.Background(), &groupVersion, policies)
+			require.NoError(t, err)
+			require.Equal(t, sets.New("first", "last"), references)
+			require.Equal(t, 2, live.listCalls, "one paginated scan must serve the whole batch")
+		})
+	}
+}
+
+func TestConstraintTemplateForVAPBinding(t *testing.T) {
+	controller := true
+	binding := &admissionregistrationv1.ValidatingAdmissionPolicyBinding{ObjectMeta: metav1.ObjectMeta{
+		Name: "binding",
+		OwnerReferences: []metav1.OwnerReference{{
+			APIVersion: statusv1beta1.ConstraintsGroup + "/v1beta1",
+			Kind:       "K8sRequiredLabels",
+			Name:       "constraint",
+			Controller: &controller,
+		}},
+	}}
+
+	binding.Spec.PolicyName = transform.GetTemplateVAPName("K8sRequiredLabels")
+	requests := constraintTemplateForVAPBinding(context.Background(), binding)
+	require.Equal(t, []reconcile.Request{{NamespacedName: types.NamespacedName{Name: "k8srequiredlabels"}}}, requests)
+
+	for index := range 100 {
+		binding.Spec.PolicyName = transform.GetConstraintVAPName("K8sRequiredLabels", fmt.Sprintf("constraint-%d", index))
+		require.Empty(t, constraintTemplateForVAPBinding(context.Background(), binding))
+	}
+	betaBinding := &admissionregistrationv1beta1.ValidatingAdmissionPolicyBinding{
+		ObjectMeta: *binding.ObjectMeta.DeepCopy(),
+		Spec: admissionregistrationv1beta1.ValidatingAdmissionPolicyBindingSpec{
+			PolicyName: transform.GetTemplateVAPName("K8sRequiredLabels"),
+		},
+	}
+	require.Equal(t, requests, constraintTemplateForVAPBinding(context.Background(), betaBinding))
+	betaBinding.Spec.PolicyName = transform.GetConstraintVAPName("K8sRequiredLabels", "constraint")
+	require.Empty(t, constraintTemplateForVAPBinding(context.Background(), betaBinding))
+
+	binding.Spec.PolicyName = transform.GetTemplateVAPName("K8sRequiredLabels")
+	binding.OwnerReferences[0].APIVersion = "apps/v1"
+	require.Empty(t, constraintTemplateForVAPBinding(context.Background(), binding))
+}
+
+func TestConstraintTemplateForVAPBindingUpdate(t *testing.T) {
+	for _, groupVersion := range []*schema.GroupVersion{&admissionregistrationv1.SchemeGroupVersion, &admissionregistrationv1beta1.SchemeGroupVersion} {
+		t.Run(groupVersion.Version, func(t *testing.T) {
+			for _, transition := range []struct {
+				name       string
+				oldPolicy  string
+				newPolicy  string
+				wantEvents int
+			}{
+				{name: "forward", oldPolicy: "gatekeeper-testkind", newPolicy: "gatekeeper-testkind-constraint-vap", wantEvents: 1},
+				{name: "rollback", oldPolicy: "gatekeeper-testkind-constraint-vap", newPolicy: "gatekeeper-testkind", wantEvents: 1},
+				{name: "specialized update", oldPolicy: "gatekeeper-testkind-constraint-vap", newPolicy: "gatekeeper-testkind-constraint-vap", wantEvents: 0},
+			} {
+				t.Run(transition.name, func(t *testing.T) {
+					makeBinding := func(policy string) client.Object {
+						binding, err := vapBindingForVersion(groupVersion)
+						require.NoError(t, err)
+						binding.SetOwnerReferences([]metav1.OwnerReference{{APIVersion: statusv1beta1.ConstraintsGroup + "/v1beta1", Kind: "TestKind", Name: "constraint", Controller: ptr.To(true)}})
+						switch binding := binding.(type) {
+						case *admissionregistrationv1.ValidatingAdmissionPolicyBinding:
+							binding.Spec.PolicyName = policy
+						case *admissionregistrationv1beta1.ValidatingAdmissionPolicyBinding:
+							binding.Spec.PolicyName = policy
+						}
+						return binding
+					}
+					queue := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
+					t.Cleanup(queue.ShutDown)
+					mapper := handler.EnqueueRequestsFromMapFunc(constraintTemplateForVAPBinding)
+					mapper.Update(context.Background(), event.UpdateEvent{ObjectOld: makeBinding(transition.oldPolicy), ObjectNew: makeBinding(transition.newPolicy)}, queue)
+					require.Equal(t, transition.wantEvents, queue.Len())
+				})
+			}
+		})
+	}
+}
+
+func setConstraintVAPGenerationMode(t *testing.T) {
+	t.Helper()
+	original := constraint.GetVAPGenerationMode()
+	require.NoError(t, constraint.SetVAPGenerationMode(constraint.VAPGenerationModeConstraint))
+	t.Cleanup(func() { require.NoError(t, constraint.SetVAPGenerationMode(original)) })
+}
+
+func makeTemplateVAPObjects(t *testing.T) (*v1beta1.ConstraintTemplate, *templates.ConstraintTemplate, *admissionregistrationv1.ValidatingAdmissionPolicy, *runtime.Scheme) {
+	t.Helper()
+	ct := makeReconcileConstraintTemplateForVap("PerConstraint", ptr.To(true), nil)
+	ct.SetUID("template-uid")
+	unversionedCT := &templates.ConstraintTemplate{}
+	scheme := runtime.NewScheme()
+	require.NoError(t, v1beta1.AddToScheme(scheme))
+	require.NoError(t, admissionregistrationv1.AddToScheme(scheme))
+	require.NoError(t, scheme.Convert(ct, unversionedCT, nil))
+	policy := &admissionregistrationv1.ValidatingAdmissionPolicy{ObjectMeta: metav1.ObjectMeta{Name: getVAPName(ct.GetName())}}
+	require.NoError(t, controllerutil.SetControllerReference(ct, policy, scheme))
+	return ct, unversionedCT, policy, scheme
+}
+
+func TestV1beta1ToV1PreservesResourceRuleScope(t *testing.T) {
+	scope := admissionregistrationv1beta1.AllScopes
+	failurePolicy := admissionregistrationv1beta1.Fail
+	v1beta1VAP := &admissionregistrationv1beta1.ValidatingAdmissionPolicy{
+		Spec: admissionregistrationv1beta1.ValidatingAdmissionPolicySpec{
+			ParamKind: &admissionregistrationv1beta1.ParamKind{
+				APIVersion: "constraints.gatekeeper.sh/v1beta1",
+				Kind:       "TestConstraint",
+			},
+			MatchConstraints: &admissionregistrationv1beta1.MatchResources{
+				ResourceRules: []admissionregistrationv1beta1.NamedRuleWithOperations{
+					{
+						RuleWithOperations: admissionregistrationv1beta1.RuleWithOperations{
+							Operations: []admissionregistrationv1beta1.OperationType{
+								admissionregistrationv1beta1.Create,
+							},
+							Rule: admissionregistrationv1beta1.Rule{
+								APIGroups:   []string{"*"},
+								APIVersions: []string{"*"},
+								Resources:   []string{"*"},
+								Scope:       &scope,
+							},
+						},
+					},
+				},
+			},
+			AuditAnnotations: []admissionregistrationv1beta1.AuditAnnotation{
+				{
+					Key:             "evaluation",
+					ValueExpression: "params == null ? '' : 'true'",
+				},
+			},
+			FailurePolicy: &failurePolicy,
+		},
+	}
+
+	v1VAP, err := v1beta1ToV1(v1beta1VAP)
+	require.NoError(t, err)
+	require.NotNil(t, v1VAP.Spec.MatchConstraints)
+	require.Len(t, v1VAP.Spec.MatchConstraints.ResourceRules, 1)
+	require.Equal(t, &scope, v1VAP.Spec.MatchConstraints.ResourceRules[0].Scope)
+	require.Equal(t, []admissionregistrationv1.AuditAnnotation{
+		{
+			Key:             "evaluation",
+			ValueExpression: "params == null ? '' : 'true'",
+		},
+	}, v1VAP.Spec.AuditAnnotations)
+}
+
+func TestReconcile_VAPV1Beta1RecreatedWhenDeleted(t *testing.T) {
+	ctx, c := setupVersionPinnedReconcileTest(t, &admissionregistrationv1beta1.SchemeGroupVersion)
+	suffix := "VapV1Beta1ShouldBeRecreated"
+
+	logger.Info("Running test: VAP v1beta1 should be recreated when deleted")
+	constraintTemplate := makeReconcileConstraintTemplateForVap(suffix, ptr.To[bool](true), nil)
+	t.Cleanup(testutils.DeleteObjectAndConfirm(ctx, t, c, expectedCRD(suffix)))
+	testutils.CreateThenCleanup(ctx, t, c, constraintTemplate)
+
+	vapName := fmt.Sprintf("gatekeeper-%s", denyall+strings.ToLower(suffix))
+
+	err := retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+		return true
+	}, func() error {
+		vap := &admissionregistrationv1beta1.ValidatingAdmissionPolicy{}
+		return c.Get(ctx, types.NamespacedName{Name: vapName}, vap)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	vapToDelete := &admissionregistrationv1beta1.ValidatingAdmissionPolicy{}
+	err = c.Get(ctx, types.NamespacedName{Name: vapName}, vapToDelete)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = c.Delete(ctx, vapToDelete)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+		return true
+	}, func() error {
+		vap := &admissionregistrationv1beta1.ValidatingAdmissionPolicy{}
+		if err := c.Get(ctx, types.NamespacedName{Name: vapName}, vap); err != nil {
+			return err
+		}
+		if vap.UID == vapToDelete.UID {
+			return fmt.Errorf("VAP was not recreated, same UID found")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReconcile_VAPV1RecreatedWhenDeleted(t *testing.T) {
+	ctx, c := setupVersionPinnedReconcileTest(t, &admissionregistrationv1.SchemeGroupVersion)
+	suffix := "VapV1ShouldBeRecreated"
+
+	logger.Info("Running test: VAP v1 should be recreated when deleted")
+	constraintTemplate := makeReconcileConstraintTemplateForVap(suffix, ptr.To[bool](true), nil)
+	t.Cleanup(testutils.DeleteObjectAndConfirm(ctx, t, c, expectedCRD(suffix)))
+	testutils.CreateThenCleanup(ctx, t, c, constraintTemplate)
+
+	vapName := fmt.Sprintf("gatekeeper-%s", denyall+strings.ToLower(suffix))
+
+	err := retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+		return true
+	}, func() error {
+		vap := &admissionregistrationv1.ValidatingAdmissionPolicy{}
+		return c.Get(ctx, types.NamespacedName{Name: vapName}, vap)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	vapToDelete := &admissionregistrationv1.ValidatingAdmissionPolicy{}
+	err = c.Get(ctx, types.NamespacedName{Name: vapName}, vapToDelete)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = c.Delete(ctx, vapToDelete)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+		return true
+	}, func() error {
+		vap := &admissionregistrationv1.ValidatingAdmissionPolicy{}
+		if err := c.Get(ctx, types.NamespacedName{Name: vapName}, vap); err != nil {
+			return err
+		}
+		if vap.UID == vapToDelete.UID {
+			return fmt.Errorf("VAP was not recreated, same UID found")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReconcile_VAPBV1Beta1RecreatedWhenDeleted(t *testing.T) {
+	ctx, c := setupVersionPinnedReconcileTest(t, &admissionregistrationv1beta1.SchemeGroupVersion)
+	suffix := "VapbV1Beta1ShouldBeRecreated"
+
+	logger.Info("Running test: VAPB v1beta1 should be recreated when deleted")
+	constraintTemplate := makeReconcileConstraintTemplateForVap(suffix, ptr.To[bool](true), nil)
+	cstr := newDenyAllCstr(suffix)
+	t.Cleanup(testutils.DeleteObjectAndConfirm(ctx, t, c, expectedCRD(suffix)))
+	testutils.CreateThenCleanup(ctx, t, c, constraintTemplate)
+
+	err := retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+		return true
+	}, func() error {
+		return c.Create(ctx, cstr)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(testutils.DeleteObjectAndConfirm(ctx, t, c, cstr))
+
+	vapbName := transform.GetVAPBindingName(cstr.GetKind(), cstr.GetName())
+
+	err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+		return true
+	}, func() error {
+		vapb := &admissionregistrationv1beta1.ValidatingAdmissionPolicyBinding{}
+		return c.Get(ctx, types.NamespacedName{Name: vapbName}, vapb)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	vapbToDelete := &admissionregistrationv1beta1.ValidatingAdmissionPolicyBinding{}
+	err = c.Get(ctx, types.NamespacedName{Name: vapbName}, vapbToDelete)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = c.Delete(ctx, vapbToDelete)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+		return true
+	}, func() error {
+		vapb := &admissionregistrationv1beta1.ValidatingAdmissionPolicyBinding{}
+		if err := c.Get(ctx, types.NamespacedName{Name: vapbName}, vapb); err != nil {
+			return err
+		}
+		if vapb.UID == vapbToDelete.UID {
+			return fmt.Errorf("VAPB was not recreated, same UID found")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReconcile_VAPBV1RecreatedWhenDeleted(t *testing.T) {
+	ctx, c := setupVersionPinnedReconcileTest(t, &admissionregistrationv1.SchemeGroupVersion)
+	suffix := "VapbV1ShouldBeRecreated"
+
+	logger.Info("Running test: VAPB v1 should be recreated when deleted")
+	constraintTemplate := makeReconcileConstraintTemplateForVap(suffix, ptr.To[bool](true), nil)
+	cstr := newDenyAllCstr(suffix)
+	t.Cleanup(testutils.DeleteObjectAndConfirm(ctx, t, c, expectedCRD(suffix)))
+	testutils.CreateThenCleanup(ctx, t, c, constraintTemplate)
+
+	err := retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+		return true
+	}, func() error {
+		return c.Create(ctx, cstr)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(testutils.DeleteObjectAndConfirm(ctx, t, c, cstr))
+
+	vapbName := transform.GetVAPBindingName(cstr.GetKind(), cstr.GetName())
+
+	err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+		return true
+	}, func() error {
+		vapb := &admissionregistrationv1.ValidatingAdmissionPolicyBinding{}
+		return c.Get(ctx, types.NamespacedName{Name: vapbName}, vapb)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	vapbToDelete := &admissionregistrationv1.ValidatingAdmissionPolicyBinding{}
+	err = c.Get(ctx, types.NamespacedName{Name: vapbName}, vapbToDelete)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = c.Delete(ctx, vapbToDelete)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+		return true
+	}, func() error {
+		vapb := &admissionregistrationv1.ValidatingAdmissionPolicyBinding{}
+		if err := c.Get(ctx, types.NamespacedName{Name: vapbName}, vapb); err != nil {
+			return err
+		}
+		if vapb.UID == vapbToDelete.UID {
+			return fmt.Errorf("VAPB was not recreated, same UID found")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 }
 
 // Tests that expectations for constraints are canceled if the corresponding constraint is deleted.
 func TestReconcile_DeleteConstraintResources(t *testing.T) {
-	log.Info("Running test: Cancel the expectations when constraint gets deleted")
-
-	g := gomega.NewGomegaWithT(t)
+	logger.Info("Running test: Cancel the expectations when constraint gets deleted")
 
 	// Setup the Manager
-	mgr, wm := setupManager(t)
+	mgr, wm := testutils.SetupManager(t, cfg)
 	c := testclient.NewRetryClient(mgr.GetClient())
-	ctx, cancelFunc := context.WithCancel(context.Background())
 
 	// start manager that will start tracker and controller
-	mgrStopped := StartTestManager(ctx, mgr, g)
-	once := sync.Once{}
-	testMgrStopped := func() {
-		once.Do(func() {
-			cancelFunc()
-			mgrStopped.Wait()
-		})
-	}
-	defer testMgrStopped()
+	ctx := context.Background()
+	testutils.StartManager(ctx, t, mgr)
 
-	// Create the constraint template object and expect the Reconcile to be created when controller starts
+	// Create the constraint template object and expect Reconcile to be called
+	// when the controller starts.
 	instance := &v1beta1.ConstraintTemplate{
-		ObjectMeta: metav1.ObjectMeta{Name: "denyall"},
+		ObjectMeta: metav1.ObjectMeta{Name: denyall},
 		Spec: v1beta1.ConstraintTemplateSpec{
 			CRD: v1beta1.CRD{
 				Spec: v1beta1.CRDSpec{
 					Names: v1beta1.Names{
-						Kind: "DenyAll",
+						Kind: DenyAll,
 					},
 				},
 			},
 			Targets: []v1beta1.Target{
 				{
-					Target: "admission.k8s.gatekeeper.sh",
+					Target: target.Name,
 					Rego: `
 package foo
 
 violation[{"msg": "denied!"}] {
 	1 == 1
 }
-`},
+`,
+				},
 			},
 		},
 	}
 
 	err := c.Create(ctx, instance)
-	g.Expect(err).NotTo(gomega.HaveOccurred())
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	defer func() { g.Expect(ignoreNotFound(c.Delete(ctx, instance))).To(gomega.BeNil()) }()
+	// TODO: Test if this removal is necessary.
+	// https://github.com/open-policy-agent/gatekeeper/pull/1595#discussion_r722819552
+	t.Cleanup(testutils.DeleteObject(t, c, instance))
 
 	gvk := schema.GroupVersionKind{
 		Group:   "constraints.gatekeeper.sh",
 		Version: "v1beta1",
-		Kind:    "DenyAll",
+		Kind:    DenyAll,
 	}
 
 	// Install constraint CRD
-	crd := makeCRD(gvk, "denyall")
-	err = applyCRD(ctx, g, c, gvk, crd)
-	g.Expect(err).NotTo(gomega.HaveOccurred(), "applying CRD")
+	crd := makeCRD(gvk, denyall)
+	err = applyCRD(ctx, c, gvk, crd)
+	if err != nil {
+		t.Fatalf("applying CRD: %v", err)
+	}
 
 	// Create the constraint for constraint template
-	cstr := newDenyAllCstr()
+	cstr := newDenyAllCstr("")
+	cstr.SetName("denyallconstraint")
 	err = c.Create(ctx, cstr)
-	g.Expect(err).NotTo(gomega.HaveOccurred())
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// creating the gatekeeper-system namespace is necessary because that's where
 	// status resources live by default
-	g.Expect(createGatekeeperNamespace(mgr.GetConfig())).NotTo(gomega.HaveOccurred())
+	err = testutils.CreateGatekeeperNamespace(mgr.GetConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// Set up tracker
-	tracker, err := readiness.SetupTracker(mgr, false)
-	g.Expect(err).NotTo(gomega.HaveOccurred())
-
-	// initialize OPA
-	driver := local.New(local.Tracing(true))
-	backend, err := opa.NewBackend(opa.Driver(driver))
+	tracker, err := readiness.SetupTrackerNoReadyz(mgr, false, false, false)
 	if err != nil {
-		t.Fatalf("unable to set up OPA backend: %s", err)
-
-	}
-	opa, err := backend.NewClient(opa.Targets(&target.K8sValidationTarget{}))
-	if err != nil {
-		t.Fatalf("unable to set up OPA client: %s", err)
+		t.Fatal(err)
 	}
 
-	_ = os.Setenv("POD_NAME", "no-pod")
-	podstatus.DisablePodOwnership()
-	cs := watch.NewSwitch()
-	pod := &corev1.Pod{}
-	pod.Name = "no-pod"
-	// events will be used to receive events from dynamic watches registered
-	events := make(chan event.GenericEvent, 1024)
-	rec, _ := newReconciler(mgr, opa, wm, cs, tracker, events, nil, func() (*corev1.Pod, error) { return pod, nil })
-	g.Expect(add(mgr, rec)).NotTo(gomega.HaveOccurred())
+	driver, err := rego.New(rego.Tracing(true))
+	if err != nil {
+		t.Fatalf("unable to set up Driver: %v", err)
+	}
+
+	cfClient, err := constraintclient.NewClient(constraintclient.Targets(&target.K8sValidationTarget{}), constraintclient.Driver(driver), constraintclient.EnforcementPoints(util.AuditEnforcementPoint))
+	if err != nil {
+		t.Fatalf("unable to set up constraint framework client: %s", err)
+	}
+
+	testutils.Setenv(t, "POD_NAME", "no-pod")
+
+	pod := fakes.Pod(
+		fakes.WithNamespace("gatekeeper-system"),
+		fakes.WithName("no-pod"),
+	)
+
+	// constraintEvents for constraint controller, constraintTemplateEvents for webhook changes
+	constraintEvents := make(chan event.GenericEvent, 1024)
+	constraintTemplateEvents := make(chan event.GenericEvent, 1024)
+	processExcluder := process.Get()
+	processExcluder.Add(getMatchEntryConfig())
+	rec, err := newReconciler(mgr, cfClient, wm, tracker, constraintEvents, nil, func(context.Context) (*corev1.Pod, error) { return pod, nil }, nil, processExcluder)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = add(mgr, rec, constraintTemplateEvents)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// get the object tracker for the constraint
 	ot := tracker.For(gvk)
@@ -488,29 +3450,52 @@ violation[{"msg": "denied!"}] {
 		t.Fatalf("unexpected tracker, got %T", ot)
 	}
 	// ensure that expectations are set for the constraint gvk
-	g.Eventually(func() bool {
-		return tr.IsExpecting(gvk, types.NamespacedName{Name: "denyallconstraint"})
-	}, timeout).Should(gomega.BeTrue(), "waiting for expectations")
+	err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+		return true
+	}, func() error {
+		gotExpected := tr.IsExpecting(gvk, types.NamespacedName{Name: "denyallconstraint"})
+		if !gotExpected {
+			return errors.New("waiting for expectations")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// Delete the constraint , the delete event will be reconciled by controller
 	// to cancel the expectation set for it by tracker
-	g.Expect(c.Delete(ctx, cstr)).NotTo(gomega.HaveOccurred())
+	err = c.Delete(ctx, cstr)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// set event channel to receive request for constraint
-	events <- event.GenericEvent{
+	constraintEvents <- event.GenericEvent{
 		Object: cstr,
 	}
 
 	// Check readiness tracker is satisfied post-reconcile
-	g.Eventually(func() bool {
-		return tracker.For(gvk).Satisfied()
-	}, timeout).Should(gomega.BeTrue())
+	err = retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+		return true
+	}, func() error {
+		satisfied := tracker.For(gvk).Satisfied()
+		if !satisfied {
+			return errors.New("not satisfied")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 }
 
-func constraintEnforced(c client.Client, g *gomega.GomegaWithT, timeout time.Duration) {
-	g.Eventually(func() error {
-		cstr := newDenyAllCstr()
-		err := c.Get(context.TODO(), types.NamespacedName{Name: "denyallconstraint"}, cstr)
+func constraintEnforced(ctx context.Context, c client.Client, suffix string) error {
+	return retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+		return true
+	}, func() error {
+		cstr := newDenyAllCstr(suffix)
+		err := c.Get(ctx, types.NamespacedName{Name: fmt.Sprintf("cstr-%s", strings.ToLower(suffix))}, cstr)
 		if err != nil {
 			return err
 		}
@@ -520,21 +3505,86 @@ func constraintEnforced(c client.Client, g *gomega.GomegaWithT, timeout time.Dur
 		}
 		if !status.Enforced {
 			obj, _ := json.MarshalIndent(cstr.Object, "", "  ")
-			// return errors.New("constraint not enforced)
 			return fmt.Errorf("constraint not enforced: \n%s", obj)
 		}
 		return nil
-	}, timeout).Should(gomega.BeNil())
+	})
 }
 
-func newDenyAllCstr() *unstructured.Unstructured {
+func stringSliceFromOps(ops []admissionregistrationv1.OperationType) []string {
+	result := make([]string, len(ops))
+	for i, op := range ops {
+		result[i] = string(op)
+	}
+	return result
+}
+
+func isConstraintStatuErrorAsExpected(ctx context.Context, c client.Client, suffix string, wantErr bool, errMsg string) error {
+	return retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+		return true
+	}, func() error {
+		cstr := newDenyAllCstr(suffix)
+		err := c.Get(ctx, types.NamespacedName{Name: fmt.Sprintf("cstr-%s", strings.ToLower(suffix))}, cstr)
+		if err != nil {
+			return err
+		}
+		status, err := getCByPodStatus(cstr)
+		if err != nil {
+			return err
+		}
+
+		switch {
+		case wantErr && len(status.Errors) == 0:
+			return fmt.Errorf("expected error not found in status, no errors present")
+		case !wantErr && len(status.Errors) > 0:
+			return fmt.Errorf("unexpected error found in status")
+		case wantErr:
+			for _, e := range status.Errors {
+				if strings.Contains(e.Message, errMsg) {
+					return nil
+				}
+			}
+			return fmt.Errorf("expected error not found in status")
+		}
+		return nil
+	})
+}
+
+func newDenyAllCstr(suffix string) *unstructured.Unstructured {
 	cstr := &unstructured.Unstructured{}
 	cstr.SetGroupVersionKind(schema.GroupVersionKind{
 		Group:   "constraints.gatekeeper.sh",
 		Version: "v1beta1",
-		Kind:    "DenyAll",
+		Kind:    DenyAll + suffix,
 	})
-	cstr.SetName("denyallconstraint")
+	cstr.SetName(fmt.Sprintf("cstr-%s", strings.ToLower(suffix)))
+	return cstr
+}
+
+func newDenyAllCstrWithScopedEA(suffix string, ep ...string) *unstructured.Unstructured {
+	pts := make([]interface{}, 0, len(ep))
+	for _, e := range ep {
+		pts = append(pts, map[string]interface{}{"name": e})
+	}
+	cstr := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"spec": map[string]interface{}{
+				"enforcementAction": "scoped",
+				"scopedEnforcementActions": []interface{}{
+					map[string]interface{}{
+						"enforcementPoints": pts,
+						"action":            "deny",
+					},
+				},
+			},
+		},
+	}
+	cstr.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "constraints.gatekeeper.sh",
+		Version: "v1beta1",
+		Kind:    DenyAll + suffix,
+	})
+	cstr.SetName(fmt.Sprintf("cstr-%s", strings.ToLower(suffix)))
 	return cstr
 }
 
@@ -613,7 +3663,7 @@ func makeCRD(gvk schema.GroupVersionKind, plural string) *apiextensionsv1.Custom
 }
 
 // applyCRD applies a CRD and waits for it to register successfully.
-func applyCRD(ctx context.Context, g *gomega.GomegaWithT, client client.Client, gvk schema.GroupVersionKind, crd client.Object) error {
+func applyCRD(ctx context.Context, client client.Client, gvk schema.GroupVersionKind, crd client.Object) error {
 	err := client.Create(ctx, crd)
 	if err != nil {
 		return err
@@ -621,47 +3671,1088 @@ func applyCRD(ctx context.Context, g *gomega.GomegaWithT, client client.Client, 
 
 	u := &unstructured.UnstructuredList{}
 	u.SetGroupVersionKind(gvk)
-	g.Eventually(func() error {
+	return retry.OnError(testutils.ConstantRetry, func(_ error) bool {
+		return true
+	}, func() error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		return client.List(ctx, u)
-	}, 5*time.Second, 100*time.Millisecond).ShouldNot(gomega.HaveOccurred())
-	return nil
-}
-
-func deleteObject(ctx context.Context, c client.Client, obj client.Object, timeout time.Duration) error {
-	err := c.Delete(ctx, obj)
-	if err != nil {
-		if errors2.IsNotFound(err) {
-			return nil
-		}
-		return err
-	}
-
-	err = wait.Poll(time.Second, timeout, func() (bool, error) {
-		// Get the object name
-		name := client.ObjectKeyFromObject(obj)
-		err := c.Get(ctx, name, obj)
-		if err != nil {
-			if errors2.IsGone(err) || errors2.IsNotFound(err) {
-				return true, nil
-			}
-			return false, err
-		}
-		return false, err
 	})
-	return err
 }
 
-func ignoreNotFound(err error) error {
-	if err != nil && errors2.IsNotFound(err) {
-		return nil
-	}
-	return err
-}
-
-// This interface is getting used by tests to check the private objects of objectTracker
+// This interface is getting used by tests to check the private objects of objectTracker.
 type testExpectations interface {
 	IsExpecting(gvk schema.GroupVersionKind, nsName types.NamespacedName) bool
+}
+
+// Test_getWebhookConfigFromCache tests the getWebhookConfigFromCache function.
+func Test_getWebhookConfigFromCache(t *testing.T) {
+	logger := logr.Discard()
+
+	t.Run("returns nil when cache is nil", func(t *testing.T) {
+		r := &ReconcileConstraintTemplate{
+			webhookCache: nil,
+		}
+
+		config := r.getWebhookConfigFromCache(logger)
+		require.Nil(t, config)
+	})
+
+	t.Run("returns nil when config not found in cache", func(t *testing.T) {
+		// Create a webhook cache with an event channel
+		cache := webhookconfigcache.NewWebhookConfigCache()
+		r := &ReconcileConstraintTemplate{
+			webhookCache: cache,
+		}
+
+		config := r.getWebhookConfigFromCache(logger)
+		// Since we haven't set any config in the cache, it should return nil
+		require.Nil(t, config)
+	})
+}
+
+// Test_transformTemplateToVAP tests the transformTemplateToVAP function.
+func Test_transformTemplateToVAP(t *testing.T) {
+	logger := logr.Discard()
+	const (
+		testWebhookName                   = "gatekeeper-validating-webhook-configuration"
+		globalExcludedNamespacesCondition = "gatekeeper_internal_match_global_excluded_namespaces"
+	)
+
+	// Create a minimal CEL-based ConstraintTemplate for testing
+	source := &celSchema.Source{
+		FailurePolicy: ptr.To[string]("Fail"),
+		Variables: []celSchema.Variable{
+			{
+				Name:       "test_var",
+				Expression: "true",
+			},
+		},
+		Validations: []celSchema.Validation{
+			{
+				Expression: "1 == 1",
+				Message:    "test message",
+			},
+		},
+	}
+
+	ct := &v1beta1.ConstraintTemplate{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-template"},
+		Spec: v1beta1.ConstraintTemplateSpec{
+			CRD: v1beta1.CRD{
+				Spec: v1beta1.CRDSpec{
+					Names: v1beta1.Names{
+						Kind: "TestTemplate",
+					},
+				},
+			},
+			Targets: []v1beta1.Target{
+				{
+					Target: target.Name,
+					Code: []v1beta1.Code{
+						{
+							Engine: "K8sNativeValidation",
+							Source: &templates.Anything{
+								Value: source.MustToUnstructured(),
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	scheme := runtime.NewScheme()
+	_ = v1beta1.AddToScheme(scheme)
+
+	unversionedCT := &templates.ConstraintTemplate{}
+	err := scheme.Convert(ct, unversionedCT, nil)
+	require.NoError(t, err)
+
+	// Save and restore transform.SyncVAPScope
+	oldSyncVAPScope := *transform.SyncVAPScope
+	defer func() { *transform.SyncVAPScope = oldSyncVAPScope }()
+
+	t.Run("SyncVAPScope disabled uses default config", func(t *testing.T) {
+		*transform.SyncVAPScope = false
+		r := &ReconcileConstraintTemplate{}
+
+		vap, err := r.transformTemplateToVAP(unversionedCT, "test-vap", logger)
+		require.NoError(t, err)
+		require.NotNil(t, vap)
+		// The VAP name is derived from the template name, not the vapName parameter
+		require.Equal(t, "gatekeeper-test-template", vap.Name)
+	})
+
+	t.Run("SyncVAPScope enabled with nil caches", func(t *testing.T) {
+		globalTestMu.Lock()
+		defer globalTestMu.Unlock()
+
+		originalSyncVAPScope := *transform.SyncVAPScope
+		defer func() { *transform.SyncVAPScope = originalSyncVAPScope }()
+		*transform.SyncVAPScope = true
+		r := &ReconcileConstraintTemplate{
+			processExcluder: nil,
+			webhookCache:    nil,
+		}
+
+		vap, err := r.transformTemplateToVAP(unversionedCT, "test-vap-synced", logger)
+		require.ErrorContains(t, err, "is not available for VAP scope synchronization")
+		require.Nil(t, vap)
+	})
+
+	t.Run("SyncVAPScope enabled without a validating webhook keeps Config exclusions", func(t *testing.T) {
+		globalTestMu.Lock()
+		defer globalTestMu.Unlock()
+		originalSyncVAPScope := *transform.SyncVAPScope
+		originalVwhName := webhook.VwhName
+		defer func() {
+			*transform.SyncVAPScope = originalSyncVAPScope
+			webhook.VwhName = originalVwhName
+		}()
+		*transform.SyncVAPScope = true
+		webhook.VwhName = ptr.To("")
+
+		excluder := process.New()
+		excluder.Add([]configv1alpha1.MatchEntry{{
+			ExcludedNamespaces: []wildcard.Wildcard{"excluded-*"},
+			Processes:          []string{string(process.Webhook)},
+		}})
+		r := &ReconcileConstraintTemplate{processExcluder: excluder}
+
+		vap, err := r.transformTemplateToVAP(unversionedCT, "test-vap", logger)
+		require.NoError(t, err)
+		require.NotNil(t, vap)
+		require.Nil(t, vap.Spec.MatchConstraints.NamespaceSelector)
+		require.Len(t, vap.Spec.MatchConstraints.ResourceRules, 1)
+		require.Equal(t, []admissionregistrationv1beta1.OperationType{admissionregistrationv1beta1.Create, admissionregistrationv1beta1.Update}, vap.Spec.MatchConstraints.ResourceRules[0].Operations)
+		require.Equal(t, []string{"*"}, vap.Spec.MatchConstraints.ResourceRules[0].Resources)
+		var hasConfigExclusion bool
+		for _, condition := range vap.Spec.MatchConditions {
+			require.NotEqual(t, "gatekeeper_internal_match_global_exempted_namespaces", condition.Name)
+			if condition.Name == globalExcludedNamespacesCondition {
+				hasConfigExclusion = true
+				require.Contains(t, condition.Expression, "excluded-*")
+			}
+		}
+		require.True(t, hasConfigExclusion)
+	})
+
+	t.Run("SyncVAPScope waits for webhook configuration and recovers", func(t *testing.T) {
+		globalTestMu.Lock()
+		defer globalTestMu.Unlock()
+		*transform.SyncVAPScope = true
+		cache := webhookconfigcache.NewWebhookConfigCache()
+		r := &ReconcileConstraintTemplate{webhookCache: cache}
+
+		vap, err := r.transformTemplateToVAP(unversionedCT, "test-vap", logger)
+		require.ErrorContains(t, err, "is not available for VAP scope synchronization")
+		require.Nil(t, vap)
+
+		selector := &metav1.LabelSelector{
+			MatchLabels: map[string]string{"environment": "production"},
+			MatchExpressions: []metav1.LabelSelectorRequirement{
+				{Key: "admission.gatekeeper.sh/ignore", Operator: metav1.LabelSelectorOpDoesNotExist},
+			},
+		}
+		config := webhookconfigcache.WebhookMatchingConfig{
+			NamespaceSelector: selector,
+			Rules: []admissionregistrationv1.RuleWithOperations{{
+				Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Create},
+				Rule: admissionregistrationv1.Rule{
+					APIGroups: []string{"*"}, APIVersions: []string{"*"}, Resources: []string{"*"},
+				},
+			}},
+		}
+		cache.UpsertConfig(*webhook.VwhName, config)
+		vap, err = r.transformTemplateToVAP(unversionedCT, "test-vap", logger)
+		require.NoError(t, err)
+		require.Equal(t, selector, vap.Spec.MatchConstraints.NamespaceSelector)
+
+		config.NamespaceSelector = nil
+		cache.UpsertConfig(*webhook.VwhName, config)
+		vap, err = r.transformTemplateToVAP(unversionedCT, "test-vap", logger)
+		require.NoError(t, err)
+		require.Nil(t, vap.Spec.MatchConstraints.NamespaceSelector)
+	})
+
+	t.Run("SyncVAPScope enabled with webhook config - adds match constraints and conditions", func(t *testing.T) {
+		// Serialize access to webhook.VwhName global variable
+		globalTestMu.Lock()
+		defer globalTestMu.Unlock()
+
+		originalSyncVAPScope := *transform.SyncVAPScope
+		defer func() { *transform.SyncVAPScope = originalSyncVAPScope }()
+		*transform.SyncVAPScope = true
+
+		cache := webhookconfigcache.NewWebhookConfigCache()
+		webhookName := testWebhookName
+
+		originalVwhName := webhook.VwhName
+		defer func() { webhook.VwhName = originalVwhName }()
+		webhook.VwhName = &webhookName
+
+		exactMatch := admissionregistrationv1.Exact
+		webhookConfig := webhookconfigcache.WebhookMatchingConfig{
+			NamespaceSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"environment": "production",
+				},
+				MatchExpressions: []metav1.LabelSelectorRequirement{
+					{
+						Key:      "tier",
+						Operator: metav1.LabelSelectorOpIn,
+						Values:   []string{"frontend", "backend"},
+					},
+				},
+			},
+			ObjectSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"app": "critical",
+				},
+			},
+			Rules: []admissionregistrationv1.RuleWithOperations{
+				{
+					Operations: []admissionregistrationv1.OperationType{
+						admissionregistrationv1.Create,
+						admissionregistrationv1.Update,
+					},
+					Rule: admissionregistrationv1.Rule{
+						APIGroups:   []string{"apps"},
+						APIVersions: []string{"v1"},
+						Resources:   []string{"deployments", "statefulsets"},
+					},
+				},
+			},
+			MatchPolicy: &exactMatch,
+			MatchConditions: []admissionregistrationv1.MatchCondition{
+				{
+					Name:       "exclude-namespace",
+					Expression: `object.metadata.namespace != "kube-system"`,
+				},
+				{
+					Name:       "require-label",
+					Expression: `has(object.metadata.labels) && has(object.metadata.labels.team)`,
+				},
+			},
+		}
+
+		cache.UpsertConfig(webhookName, webhookConfig)
+
+		r := &ReconcileConstraintTemplate{
+			processExcluder: nil,
+			webhookCache:    cache,
+		}
+
+		vap, err := r.transformTemplateToVAP(unversionedCT, "test-vap-with-webhook-config", logger)
+		require.NoError(t, err)
+		require.NotNil(t, vap)
+
+		require.NotNil(t, vap.Spec.MatchConstraints)
+		require.NotNil(t, vap.Spec.MatchConstraints.NamespaceSelector)
+		require.NotNil(t, vap.Spec.MatchConstraints.ObjectSelector)
+
+		require.Equal(t, "production", vap.Spec.MatchConstraints.NamespaceSelector.MatchLabels["environment"])
+		require.Len(t, vap.Spec.MatchConstraints.NamespaceSelector.MatchExpressions, 1)
+		require.Equal(t, "tier", vap.Spec.MatchConstraints.NamespaceSelector.MatchExpressions[0].Key)
+
+		require.Equal(t, "critical", vap.Spec.MatchConstraints.ObjectSelector.MatchLabels["app"])
+
+		require.NotNil(t, vap.Spec.MatchConstraints.ResourceRules)
+		require.Len(t, vap.Spec.MatchConstraints.ResourceRules, 1)
+		require.Contains(t, vap.Spec.MatchConstraints.ResourceRules[0].Operations, admissionregistrationv1beta1.Create)
+		require.Contains(t, vap.Spec.MatchConstraints.ResourceRules[0].Operations, admissionregistrationv1beta1.Update)
+		require.Equal(t, []string{"apps"}, vap.Spec.MatchConstraints.ResourceRules[0].APIGroups)
+		require.Equal(t, []string{"v1"}, vap.Spec.MatchConstraints.ResourceRules[0].APIVersions)
+		require.Equal(t, []string{"deployments", "statefulsets"}, vap.Spec.MatchConstraints.ResourceRules[0].Resources)
+
+		require.NotNil(t, vap.Spec.MatchConstraints.MatchPolicy)
+		exactMatchBeta := admissionregistrationv1beta1.Exact
+		require.Equal(t, &exactMatchBeta, vap.Spec.MatchConstraints.MatchPolicy)
+
+		require.NotNil(t, vap.Spec.MatchConditions)
+		webhookConditionsFound := 0
+		for _, cond := range vap.Spec.MatchConditions {
+			if cond.Name == "exclude-namespace" {
+				require.Equal(t, `object.metadata.namespace != "kube-system"`, cond.Expression)
+				webhookConditionsFound++
+			}
+			if cond.Name == "require-label" {
+				require.Equal(t, `has(object.metadata.labels) && has(object.metadata.labels.team)`, cond.Expression)
+				webhookConditionsFound++
+			}
+		}
+		require.Equal(t, 2, webhookConditionsFound)
+	})
+
+	t.Run("SyncVAPScope enabled with excluded namespaces - adds to match conditions", func(t *testing.T) {
+		globalTestMu.Lock()
+		defer globalTestMu.Unlock()
+
+		originalSyncVAPScope := *transform.SyncVAPScope
+		defer func() { *transform.SyncVAPScope = originalSyncVAPScope }()
+		*transform.SyncVAPScope = true
+
+		processExcluder := process.Get()
+		processExcluder.Add([]configv1alpha1.MatchEntry{
+			{
+				ExcludedNamespaces: []wildcard.Wildcard{"kube-system", "gatekeeper-system"},
+				Processes:          []string{"webhook"},
+			},
+		})
+
+		cache := webhookconfigcache.NewWebhookConfigCache()
+		cache.UpsertConfig(*webhook.VwhName, webhookconfigcache.WebhookMatchingConfig{
+			Rules: []admissionregistrationv1.RuleWithOperations{{
+				Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Create},
+				Rule: admissionregistrationv1.Rule{
+					APIGroups: []string{"*"}, APIVersions: []string{"*"}, Resources: []string{"*"},
+				},
+			}},
+		})
+
+		r := &ReconcileConstraintTemplate{
+			processExcluder: processExcluder,
+			webhookCache:    cache,
+		}
+
+		vap, err := r.transformTemplateToVAP(unversionedCT, "test-vap-with-excluded-ns", logger)
+		require.NoError(t, err)
+		require.NotNil(t, vap)
+
+		require.NotNil(t, vap.Spec.MatchConditions)
+		hasExcludedNsCondition := false
+		for _, cond := range vap.Spec.MatchConditions {
+			if cond.Name == globalExcludedNamespacesCondition {
+				hasExcludedNsCondition = true
+				require.Contains(t, cond.Expression, "kube-system")
+				require.Contains(t, cond.Expression, "gatekeeper-system")
+				break
+			}
+		}
+		require.True(t, hasExcludedNsCondition)
+	})
+
+	t.Run("SyncVAPScope enabled with webhook config and excluded namespaces - combines both", func(t *testing.T) {
+		globalTestMu.Lock()
+		defer globalTestMu.Unlock()
+
+		originalSyncVAPScope := *transform.SyncVAPScope
+		defer func() { *transform.SyncVAPScope = originalSyncVAPScope }()
+		*transform.SyncVAPScope = true
+
+		processExcluder := process.Get()
+		processExcluder.Add([]configv1alpha1.MatchEntry{
+			{
+				ExcludedNamespaces: []wildcard.Wildcard{"test-exclude"},
+				Processes:          []string{"webhook"},
+			},
+		})
+
+		cache := webhookconfigcache.NewWebhookConfigCache()
+		webhookName := testWebhookName
+
+		originalVwhName := webhook.VwhName
+		defer func() { webhook.VwhName = originalVwhName }()
+		webhook.VwhName = &webhookName
+		webhookConfig := webhookconfigcache.WebhookMatchingConfig{
+			NamespaceSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"monitored": "true",
+				},
+			},
+			MatchConditions: []admissionregistrationv1.MatchCondition{
+				{
+					Name:       "custom-condition",
+					Expression: `object.metadata.name.startsWith("prod-")`,
+				},
+			},
+		}
+		cache.UpsertConfig(webhookName, webhookConfig)
+
+		r := &ReconcileConstraintTemplate{
+			processExcluder: processExcluder,
+			webhookCache:    cache,
+		}
+
+		vap, err := r.transformTemplateToVAP(unversionedCT, "test-vap-combined", logger)
+		require.NoError(t, err)
+		require.NotNil(t, vap)
+
+		require.NotNil(t, vap.Spec.MatchConditions)
+		hasWebhookCondition := false
+		hasExcludedNsCondition := false
+		for _, cond := range vap.Spec.MatchConditions {
+			if cond.Name == "custom-condition" {
+				hasWebhookCondition = true
+				require.Equal(t, `object.metadata.name.startsWith("prod-")`, cond.Expression)
+			}
+			if cond.Name == globalExcludedNamespacesCondition {
+				hasExcludedNsCondition = true
+				require.Contains(t, cond.Expression, "test-exclude")
+			}
+		}
+		require.True(t, hasWebhookCondition)
+		require.True(t, hasExcludedNsCondition)
+
+		require.NotNil(t, vap.Spec.MatchConstraints)
+		require.NotNil(t, vap.Spec.MatchConstraints.NamespaceSelector)
+		require.Equal(t, "true", vap.Spec.MatchConstraints.NamespaceSelector.MatchLabels["monitored"])
+	})
+
+	t.Run("ConstraintTemplate with operations - intersection with webhook operations", func(t *testing.T) {
+		globalTestMu.Lock()
+		defer globalTestMu.Unlock()
+
+		originalSyncVAPScope := *transform.SyncVAPScope
+		defer func() { *transform.SyncVAPScope = originalSyncVAPScope }()
+		*transform.SyncVAPScope = true
+
+		ctWithOps := &v1beta1.ConstraintTemplate{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-template-with-ops"},
+			Spec: v1beta1.ConstraintTemplateSpec{
+				CRD: v1beta1.CRD{
+					Spec: v1beta1.CRDSpec{
+						Names: v1beta1.Names{Kind: "TestTemplateWithOps"},
+					},
+				},
+				Targets: []v1beta1.Target{
+					{
+						Target: target.Name,
+						Operations: []admissionregistrationv1.OperationType{
+							admissionregistrationv1.Create,
+							admissionregistrationv1.Update,
+						},
+						Code: []v1beta1.Code{
+							{
+								Engine: "K8sNativeValidation",
+								Source: &templates.Anything{Value: source.MustToUnstructured()},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		scheme := runtime.NewScheme()
+		_ = v1beta1.AddToScheme(scheme)
+		unversionedCTWithOps := &templates.ConstraintTemplate{}
+		err := scheme.Convert(ctWithOps, unversionedCTWithOps, nil)
+		require.NoError(t, err)
+
+		cache := webhookconfigcache.NewWebhookConfigCache()
+		webhookName := testWebhookName
+		originalVwhName := webhook.VwhName
+		defer func() { webhook.VwhName = originalVwhName }()
+		webhook.VwhName = &webhookName
+
+		webhookConfig := webhookconfigcache.WebhookMatchingConfig{
+			Rules: []admissionregistrationv1.RuleWithOperations{
+				{
+					Operations: []admissionregistrationv1.OperationType{
+						admissionregistrationv1.Create,
+						admissionregistrationv1.Update,
+						admissionregistrationv1.Delete,
+					},
+					Rule: admissionregistrationv1.Rule{
+						APIGroups:   []string{"apps"},
+						APIVersions: []string{"v1"},
+						Resources:   []string{"deployments"},
+					},
+				},
+			},
+		}
+		cache.UpsertConfig(webhookName, webhookConfig)
+
+		r := &ReconcileConstraintTemplate{webhookCache: cache}
+		vap, err := r.transformTemplateToVAP(unversionedCTWithOps, "test-vap-ops-intersection", logger)
+		require.NoError(t, err)
+		require.NotNil(t, vap)
+
+		operations := vap.Spec.MatchConstraints.ResourceRules[0].Operations
+		require.Contains(t, operations, admissionregistrationv1beta1.Create)
+		require.Contains(t, operations, admissionregistrationv1beta1.Update)
+		require.NotContains(t, operations, admissionregistrationv1beta1.Delete)
+		require.Len(t, operations, 2)
+	})
+
+	t.Run("ConstraintTemplate operations mismatch - logs warning but continues", func(t *testing.T) {
+		globalTestMu.Lock()
+		defer globalTestMu.Unlock()
+
+		originalSyncVAPScope := *transform.SyncVAPScope
+		defer func() { *transform.SyncVAPScope = originalSyncVAPScope }()
+		*transform.SyncVAPScope = true
+
+		ctWithMismatchOps := &v1beta1.ConstraintTemplate{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-template-mismatch-ops"},
+			Spec: v1beta1.ConstraintTemplateSpec{
+				CRD: v1beta1.CRD{
+					Spec: v1beta1.CRDSpec{
+						Names: v1beta1.Names{Kind: "TestTemplateMismatchOps"},
+					},
+				},
+				Targets: []v1beta1.Target{
+					{
+						Target: target.Name,
+						Operations: []admissionregistrationv1.OperationType{
+							admissionregistrationv1.Create,
+							admissionregistrationv1.Delete,
+						},
+						Code: []v1beta1.Code{
+							{
+								Engine: "K8sNativeValidation",
+								Source: &templates.Anything{Value: source.MustToUnstructured()},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		scheme := runtime.NewScheme()
+		_ = v1beta1.AddToScheme(scheme)
+		unversionedCTMismatch := &templates.ConstraintTemplate{}
+		err := scheme.Convert(ctWithMismatchOps, unversionedCTMismatch, nil)
+		require.NoError(t, err)
+
+		cache := webhookconfigcache.NewWebhookConfigCache()
+		webhookName := testWebhookName
+		originalVwhName := webhook.VwhName
+		defer func() { webhook.VwhName = originalVwhName }()
+		webhook.VwhName = &webhookName
+
+		webhookConfig := webhookconfigcache.WebhookMatchingConfig{
+			Rules: []admissionregistrationv1.RuleWithOperations{
+				{
+					Operations: []admissionregistrationv1.OperationType{
+						admissionregistrationv1.Create,
+						admissionregistrationv1.Update,
+					},
+					Rule: admissionregistrationv1.Rule{
+						APIGroups:   []string{"apps"},
+						APIVersions: []string{"v1"},
+						Resources:   []string{"deployments"},
+					},
+				},
+			},
+		}
+		cache.UpsertConfig(webhookName, webhookConfig)
+
+		r := &ReconcileConstraintTemplate{webhookCache: cache}
+		vap, err := r.transformTemplateToVAP(unversionedCTMismatch, "test-vap-ops-mismatch", logger)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "operations mismatch")
+		require.NotNil(t, vap)
+
+		operations := vap.Spec.MatchConstraints.ResourceRules[0].Operations
+		require.Contains(t, operations, admissionregistrationv1beta1.Create)
+		require.NotContains(t, operations, admissionregistrationv1beta1.Delete)
+		require.Len(t, operations, 1)
+	})
+
+	t.Run("ConstraintTemplate no matching operations - returns error", func(t *testing.T) {
+		globalTestMu.Lock()
+		defer globalTestMu.Unlock()
+
+		originalSyncVAPScope := *transform.SyncVAPScope
+		defer func() { *transform.SyncVAPScope = originalSyncVAPScope }()
+		*transform.SyncVAPScope = true
+
+		ctNoMatch := &v1beta1.ConstraintTemplate{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-template-no-match"},
+			Spec: v1beta1.ConstraintTemplateSpec{
+				CRD: v1beta1.CRD{
+					Spec: v1beta1.CRDSpec{
+						Names: v1beta1.Names{Kind: "TestTemplateNoMatch"},
+					},
+				},
+				Targets: []v1beta1.Target{
+					{
+						Target: target.Name,
+						Operations: []admissionregistrationv1.OperationType{
+							admissionregistrationv1.Delete,
+						},
+						Code: []v1beta1.Code{
+							{
+								Engine: "K8sNativeValidation",
+								Source: &templates.Anything{Value: source.MustToUnstructured()},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		scheme := runtime.NewScheme()
+		_ = v1beta1.AddToScheme(scheme)
+		unversionedCTNoMatch := &templates.ConstraintTemplate{}
+		err := scheme.Convert(ctNoMatch, unversionedCTNoMatch, nil)
+		require.NoError(t, err)
+
+		cache := webhookconfigcache.NewWebhookConfigCache()
+		webhookName := testWebhookName
+		originalVwhName := webhook.VwhName
+		defer func() { webhook.VwhName = originalVwhName }()
+		webhook.VwhName = &webhookName
+
+		webhookConfig := webhookconfigcache.WebhookMatchingConfig{
+			Rules: []admissionregistrationv1.RuleWithOperations{
+				{
+					Operations: []admissionregistrationv1.OperationType{
+						admissionregistrationv1.Create,
+						admissionregistrationv1.Update,
+					},
+					Rule: admissionregistrationv1.Rule{
+						APIGroups:   []string{"apps"},
+						APIVersions: []string{"v1"},
+						Resources:   []string{"deployments"},
+					},
+				},
+			},
+		}
+		cache.UpsertConfig(webhookName, webhookConfig)
+
+		r := &ReconcileConstraintTemplate{webhookCache: cache}
+		_, err = r.transformTemplateToVAP(unversionedCTNoMatch, "test-vap-no-match", logger)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "no matching operations")
+	})
+
+	t.Run("ConstraintTemplate with nil operations - uses all webhook operations", func(t *testing.T) {
+		globalTestMu.Lock()
+		defer globalTestMu.Unlock()
+
+		originalSyncVAPScope := *transform.SyncVAPScope
+		defer func() { *transform.SyncVAPScope = originalSyncVAPScope }()
+		*transform.SyncVAPScope = true
+
+		ctNilOps := &v1beta1.ConstraintTemplate{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-template-nil-ops"},
+			Spec: v1beta1.ConstraintTemplateSpec{
+				CRD: v1beta1.CRD{
+					Spec: v1beta1.CRDSpec{
+						Names: v1beta1.Names{Kind: "TestTemplateNilOps"},
+					},
+				},
+				Targets: []v1beta1.Target{
+					{
+						Target: target.Name,
+						Code: []v1beta1.Code{
+							{
+								Engine: "K8sNativeValidation",
+								Source: &templates.Anything{Value: source.MustToUnstructured()},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		scheme := runtime.NewScheme()
+		_ = v1beta1.AddToScheme(scheme)
+		unversionedCTNilOps := &templates.ConstraintTemplate{}
+		err := scheme.Convert(ctNilOps, unversionedCTNilOps, nil)
+		require.NoError(t, err)
+
+		cache := webhookconfigcache.NewWebhookConfigCache()
+		webhookName := testWebhookName
+		originalVwhName := webhook.VwhName
+		defer func() { webhook.VwhName = originalVwhName }()
+		webhook.VwhName = &webhookName
+
+		webhookConfig := webhookconfigcache.WebhookMatchingConfig{
+			Rules: []admissionregistrationv1.RuleWithOperations{
+				{
+					Operations: []admissionregistrationv1.OperationType{
+						admissionregistrationv1.Create,
+						admissionregistrationv1.Update,
+						admissionregistrationv1.Delete,
+					},
+					Rule: admissionregistrationv1.Rule{
+						APIGroups:   []string{"apps"},
+						APIVersions: []string{"v1"},
+						Resources:   []string{"deployments"},
+					},
+				},
+			},
+		}
+		cache.UpsertConfig(webhookName, webhookConfig)
+
+		r := &ReconcileConstraintTemplate{webhookCache: cache}
+		vap, err := r.transformTemplateToVAP(unversionedCTNilOps, "test-vap-nil-ops", logger)
+		require.NoError(t, err)
+		require.NotNil(t, vap)
+
+		operations := vap.Spec.MatchConstraints.ResourceRules[0].Operations
+		require.Contains(t, operations, admissionregistrationv1beta1.Create)
+		require.Contains(t, operations, admissionregistrationv1beta1.Update)
+		require.Contains(t, operations, admissionregistrationv1beta1.Delete)
+		require.Len(t, operations, 3)
+	})
+
+	t.Run("ConstraintTemplate with wildcard operations - matches all webhook operations", func(t *testing.T) {
+		globalTestMu.Lock()
+		defer globalTestMu.Unlock()
+
+		originalSyncVAPScope := *transform.SyncVAPScope
+		defer func() { *transform.SyncVAPScope = originalSyncVAPScope }()
+		*transform.SyncVAPScope = true
+
+		ctWildcard := &v1beta1.ConstraintTemplate{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-template-wildcard"},
+			Spec: v1beta1.ConstraintTemplateSpec{
+				CRD: v1beta1.CRD{
+					Spec: v1beta1.CRDSpec{
+						Names: v1beta1.Names{Kind: "TestTemplateWildcard"},
+					},
+				},
+				Targets: []v1beta1.Target{
+					{
+						Target: target.Name,
+						Operations: []admissionregistrationv1.OperationType{
+							admissionregistrationv1.OperationAll,
+						},
+						Code: []v1beta1.Code{
+							{
+								Engine: "K8sNativeValidation",
+								Source: &templates.Anything{Value: source.MustToUnstructured()},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		scheme := runtime.NewScheme()
+		_ = v1beta1.AddToScheme(scheme)
+		unversionedCTWildcard := &templates.ConstraintTemplate{}
+		err := scheme.Convert(ctWildcard, unversionedCTWildcard, nil)
+		require.NoError(t, err)
+
+		cache := webhookconfigcache.NewWebhookConfigCache()
+		webhookName := testWebhookName
+		originalVwhName := webhook.VwhName
+		defer func() { webhook.VwhName = originalVwhName }()
+		webhook.VwhName = &webhookName
+
+		webhookConfig := webhookconfigcache.WebhookMatchingConfig{
+			Rules: []admissionregistrationv1.RuleWithOperations{
+				{
+					Operations: []admissionregistrationv1.OperationType{
+						admissionregistrationv1.Create,
+						admissionregistrationv1.Update,
+					},
+					Rule: admissionregistrationv1.Rule{
+						APIGroups:   []string{"apps"},
+						APIVersions: []string{"v1"},
+						Resources:   []string{"deployments"},
+					},
+				},
+			},
+		}
+		cache.UpsertConfig(webhookName, webhookConfig)
+
+		r := &ReconcileConstraintTemplate{webhookCache: cache}
+		vap, err := r.transformTemplateToVAP(unversionedCTWildcard, "test-vap-wildcard", logger)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "operations mismatch")
+		require.NotNil(t, vap)
+
+		operations := vap.Spec.MatchConstraints.ResourceRules[0].Operations
+		require.Contains(t, operations, admissionregistrationv1beta1.Create)
+		require.Contains(t, operations, admissionregistrationv1beta1.Update)
+		require.Len(t, operations, 2)
+	})
+
+	t.Run("Webhook with wildcard operations - intersects with specific CT operations", func(t *testing.T) {
+		globalTestMu.Lock()
+		defer globalTestMu.Unlock()
+
+		originalSyncVAPScope := *transform.SyncVAPScope
+		defer func() { *transform.SyncVAPScope = originalSyncVAPScope }()
+		*transform.SyncVAPScope = true
+
+		ctSpecific := &v1beta1.ConstraintTemplate{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-template-specific"},
+			Spec: v1beta1.ConstraintTemplateSpec{
+				CRD: v1beta1.CRD{
+					Spec: v1beta1.CRDSpec{
+						Names: v1beta1.Names{Kind: "TestTemplateSpecific"},
+					},
+				},
+				Targets: []v1beta1.Target{
+					{
+						Target: target.Name,
+						Operations: []admissionregistrationv1.OperationType{
+							admissionregistrationv1.Create,
+							admissionregistrationv1.Delete,
+						},
+						Code: []v1beta1.Code{
+							{
+								Engine: "K8sNativeValidation",
+								Source: &templates.Anything{Value: source.MustToUnstructured()},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		scheme := runtime.NewScheme()
+		_ = v1beta1.AddToScheme(scheme)
+		unversionedCTSpecific := &templates.ConstraintTemplate{}
+		err := scheme.Convert(ctSpecific, unversionedCTSpecific, nil)
+		require.NoError(t, err)
+
+		cache := webhookconfigcache.NewWebhookConfigCache()
+		webhookName := testWebhookName
+		originalVwhName := webhook.VwhName
+		defer func() { webhook.VwhName = originalVwhName }()
+		webhook.VwhName = &webhookName
+
+		webhookConfig := webhookconfigcache.WebhookMatchingConfig{
+			Rules: []admissionregistrationv1.RuleWithOperations{
+				{
+					Operations: []admissionregistrationv1.OperationType{
+						admissionregistrationv1.OperationAll,
+					},
+					Rule: admissionregistrationv1.Rule{
+						APIGroups:   []string{"apps"},
+						APIVersions: []string{"v1"},
+						Resources:   []string{"deployments"},
+					},
+				},
+			},
+		}
+		cache.UpsertConfig(webhookName, webhookConfig)
+
+		r := &ReconcileConstraintTemplate{webhookCache: cache}
+		vap, err := r.transformTemplateToVAP(unversionedCTSpecific, "test-vap-webhook-wildcard", logger)
+		require.NoError(t, err)
+		require.NotNil(t, vap)
+
+		operations := vap.Spec.MatchConstraints.ResourceRules[0].Operations
+		require.Contains(t, operations, admissionregistrationv1beta1.Create)
+		require.Contains(t, operations, admissionregistrationv1beta1.Delete)
+		require.Len(t, operations, 2)
+	})
+
+	t.Run("Both webhook and CT with wildcard operations", func(t *testing.T) {
+		globalTestMu.Lock()
+		defer globalTestMu.Unlock()
+
+		originalSyncVAPScope := *transform.SyncVAPScope
+		defer func() { *transform.SyncVAPScope = originalSyncVAPScope }()
+		*transform.SyncVAPScope = true
+
+		ctWildcard := &v1beta1.ConstraintTemplate{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-template-both-wildcard"},
+			Spec: v1beta1.ConstraintTemplateSpec{
+				CRD: v1beta1.CRD{
+					Spec: v1beta1.CRDSpec{
+						Names: v1beta1.Names{Kind: "TestTemplateBothWildcard"},
+					},
+				},
+				Targets: []v1beta1.Target{
+					{
+						Target: target.Name,
+						Operations: []admissionregistrationv1.OperationType{
+							admissionregistrationv1.OperationAll,
+						},
+						Code: []v1beta1.Code{
+							{
+								Engine: "K8sNativeValidation",
+								Source: &templates.Anything{Value: source.MustToUnstructured()},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		scheme := runtime.NewScheme()
+		_ = v1beta1.AddToScheme(scheme)
+		unversionedCTBothWildcard := &templates.ConstraintTemplate{}
+		err := scheme.Convert(ctWildcard, unversionedCTBothWildcard, nil)
+		require.NoError(t, err)
+
+		cache := webhookconfigcache.NewWebhookConfigCache()
+		webhookName := testWebhookName
+		originalVwhName := webhook.VwhName
+		defer func() { webhook.VwhName = originalVwhName }()
+		webhook.VwhName = &webhookName
+
+		webhookConfig := webhookconfigcache.WebhookMatchingConfig{
+			Rules: []admissionregistrationv1.RuleWithOperations{
+				{
+					Operations: []admissionregistrationv1.OperationType{
+						admissionregistrationv1.OperationAll,
+					},
+					Rule: admissionregistrationv1.Rule{
+						APIGroups:   []string{"apps"},
+						APIVersions: []string{"v1"},
+						Resources:   []string{"deployments"},
+					},
+				},
+			},
+		}
+		cache.UpsertConfig(webhookName, webhookConfig)
+
+		r := &ReconcileConstraintTemplate{webhookCache: cache}
+		vap, err := r.transformTemplateToVAP(unversionedCTBothWildcard, "test-vap-both-wildcard", logger)
+		require.NoError(t, err)
+		require.NotNil(t, vap)
+
+		operations := vap.Spec.MatchConstraints.ResourceRules[0].Operations
+		require.Contains(t, operations, admissionregistrationv1beta1.Create)
+		require.Contains(t, operations, admissionregistrationv1beta1.Update)
+		require.Contains(t, operations, admissionregistrationv1beta1.Delete)
+		require.Contains(t, operations, admissionregistrationv1beta1.Connect)
+		require.Len(t, operations, 4)
+	})
+
+	t.Run("Webhook supports all operations and CT supports CREATE", func(t *testing.T) {
+		globalTestMu.Lock()
+		defer globalTestMu.Unlock()
+
+		originalSyncVAPScope := *transform.SyncVAPScope
+		defer func() { *transform.SyncVAPScope = originalSyncVAPScope }()
+		*transform.SyncVAPScope = true
+
+		ctCreate := &v1beta1.ConstraintTemplate{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-template-create-only"},
+			Spec: v1beta1.ConstraintTemplateSpec{
+				CRD: v1beta1.CRD{
+					Spec: v1beta1.CRDSpec{
+						Names: v1beta1.Names{Kind: "TestTemplateCreateOnly"},
+					},
+				},
+				Targets: []v1beta1.Target{
+					{
+						Target: target.Name,
+						Operations: []admissionregistrationv1.OperationType{
+							admissionregistrationv1.Create,
+						},
+						Code: []v1beta1.Code{
+							{
+								Engine: "K8sNativeValidation",
+								Source: &templates.Anything{Value: source.MustToUnstructured()},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		scheme := runtime.NewScheme()
+		_ = v1beta1.AddToScheme(scheme)
+		unversionedCTCreate := &templates.ConstraintTemplate{}
+		err := scheme.Convert(ctCreate, unversionedCTCreate, nil)
+		require.NoError(t, err)
+
+		cache := webhookconfigcache.NewWebhookConfigCache()
+		webhookName := testWebhookName
+		originalVwhName := webhook.VwhName
+		defer func() { webhook.VwhName = originalVwhName }()
+		webhook.VwhName = &webhookName
+
+		webhookConfig := webhookconfigcache.WebhookMatchingConfig{
+			Rules: []admissionregistrationv1.RuleWithOperations{
+				{
+					Operations: []admissionregistrationv1.OperationType{
+						admissionregistrationv1.OperationAll,
+					},
+					Rule: admissionregistrationv1.Rule{
+						APIGroups:   []string{"apps"},
+						APIVersions: []string{"v1"},
+						Resources:   []string{"deployments"},
+					},
+				},
+			},
+		}
+		cache.UpsertConfig(webhookName, webhookConfig)
+
+		r := &ReconcileConstraintTemplate{webhookCache: cache}
+		vap, err := r.transformTemplateToVAP(unversionedCTCreate, "test-vap-webhook-all-ct-create", logger)
+		require.NoError(t, err)
+		require.NotNil(t, vap)
+
+		operations := vap.Spec.MatchConstraints.ResourceRules[0].Operations
+		require.Contains(t, operations, admissionregistrationv1beta1.Create)
+		require.Len(t, operations, 1)
+	})
+
+	t.Run("CT supports all operations and webhook supports CREATE", func(t *testing.T) {
+		globalTestMu.Lock()
+		defer globalTestMu.Unlock()
+
+		originalSyncVAPScope := *transform.SyncVAPScope
+		defer func() { *transform.SyncVAPScope = originalSyncVAPScope }()
+		*transform.SyncVAPScope = true
+
+		ctAll := &v1beta1.ConstraintTemplate{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-template-all-ops"},
+			Spec: v1beta1.ConstraintTemplateSpec{
+				CRD: v1beta1.CRD{
+					Spec: v1beta1.CRDSpec{
+						Names: v1beta1.Names{Kind: "TestTemplateAllOps"},
+					},
+				},
+				Targets: []v1beta1.Target{
+					{
+						Target: target.Name,
+						Operations: []admissionregistrationv1.OperationType{
+							admissionregistrationv1.OperationAll,
+						},
+						Code: []v1beta1.Code{
+							{
+								Engine: "K8sNativeValidation",
+								Source: &templates.Anything{Value: source.MustToUnstructured()},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		scheme := runtime.NewScheme()
+		_ = v1beta1.AddToScheme(scheme)
+		unversionedCTAll := &templates.ConstraintTemplate{}
+		err := scheme.Convert(ctAll, unversionedCTAll, nil)
+		require.NoError(t, err)
+
+		cache := webhookconfigcache.NewWebhookConfigCache()
+		webhookName := testWebhookName
+		originalVwhName := webhook.VwhName
+		defer func() { webhook.VwhName = originalVwhName }()
+		webhook.VwhName = &webhookName
+
+		webhookConfig := webhookconfigcache.WebhookMatchingConfig{
+			Rules: []admissionregistrationv1.RuleWithOperations{
+				{
+					Operations: []admissionregistrationv1.OperationType{
+						admissionregistrationv1.Create,
+					},
+					Rule: admissionregistrationv1.Rule{
+						APIGroups:   []string{"apps"},
+						APIVersions: []string{"v1"},
+						Resources:   []string{"deployments"},
+					},
+				},
+			},
+		}
+		cache.UpsertConfig(webhookName, webhookConfig)
+
+		r := &ReconcileConstraintTemplate{webhookCache: cache}
+		vap, err := r.transformTemplateToVAP(unversionedCTAll, "test-vap-ct-all-webhook-create", logger)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "operations mismatch")
+		require.NotNil(t, vap)
+
+		operations := vap.Spec.MatchConstraints.ResourceRules[0].Operations
+		require.Contains(t, operations, admissionregistrationv1beta1.Create)
+		require.Len(t, operations, 1)
+	})
 }

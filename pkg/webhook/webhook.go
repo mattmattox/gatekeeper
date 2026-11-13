@@ -16,14 +16,28 @@ limitations under the License.
 package webhook
 
 import (
-	"github.com/open-policy-agent/frameworks/constraint/pkg/client"
-	"github.com/open-policy-agent/gatekeeper/pkg/controller/config/process"
-	"github.com/open-policy-agent/gatekeeper/pkg/mutation"
+	"context"
+
+	constraintclient "github.com/open-policy-agent/frameworks/constraint/pkg/client"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/controller/config/process"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/expansion"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/export"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/mutation"
+	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 )
 
-// AddToManagerFuncs is a list of functions to add all Controllers to the Manager
-var AddToManagerFuncs []func(manager.Manager, *client.Client, *process.Excluder, *mutation.System) error
+type Dependencies struct {
+	OpaClient       *constraintclient.Client
+	ProcessExcluder *process.Excluder
+	MutationSystem  *mutation.System
+	ExpansionSystem *expansion.System
+	ExportSystem    export.Exporter
+	GetPod          func(context.Context) (*corev1.Pod, error)
+}
+
+// AddToManagerFuncs is a list of functions to add all Controllers to the Manager.
+var AddToManagerFuncs []func(manager.Manager, Dependencies) error
 
 // The below autogen directive is currently disabled because controller-gen has
 // no way of specifying the resource name restriction
@@ -32,10 +46,10 @@ var AddToManagerFuncs []func(manager.Manager, *client.Client, *process.Excluder,
 // +kubebuilder:rbac:groups="",namespace=gatekeeper-system,resources=secrets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",namespace=gatekeeper-system,resources=events,verbs=create;patch
 
-// AddToManager adds all Controllers to the Manager
-func AddToManager(m manager.Manager, opa *client.Client, processExcluder *process.Excluder, mutationCache *mutation.System) error {
+// AddToManager adds all Controllers to the Manager.
+func AddToManager(m manager.Manager, deps Dependencies) error {
 	for _, f := range AddToManagerFuncs {
-		if err := f(m, opa, processExcluder, mutationCache); err != nil {
+		if err := f(m, deps); err != nil {
 			return err
 		}
 	}

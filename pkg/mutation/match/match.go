@@ -3,195 +3,344 @@ package match
 import (
 	"errors"
 	"fmt"
+	"reflect"
 
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/mutation/types"
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// ApplyTo determines what GVKs items the mutation should apply to.
-// Globs are not allowed.
-// +kubebuilder:object:generate=true
-type ApplyTo struct {
-	Groups   []string `json:"groups,omitempty"`
-	Kinds    []string `json:"kinds,omitempty"`
-	Versions []string `json:"versions,omitempty"`
+var ErrMatch = errors.New("failed to run Match criteria")
+
+// Wildcard represents matching any Group, Version, or Kind.
+// Only for use in Match, not ApplyTo.
+const Wildcard = "*"
+
+// Matchable represent an object to be matched along with its metadata.
+// +kubebuilder:object:generate=false
+type Matchable struct {
+	Object    client.Object
+	Namespace *corev1.Namespace
+	Source    types.SourceType
 }
 
-// Match selects objects to apply mutations to.
-// +kubebuilder:object:generate=true
-type Match struct {
-	Kinds              []Kinds                       `json:"kinds,omitempty"`
-	Scope              apiextensionsv1.ResourceScope `json:"scope,omitempty"`
-	Namespaces         []string                      `json:"namespaces,omitempty"`
-	ExcludedNamespaces []string                      `json:"excludedNamespaces,omitempty"`
-	LabelSelector      *metav1.LabelSelector         `json:"labelSelector,omitempty"`
-	NamespaceSelector  *metav1.LabelSelector         `json:"namespaceSelector,omitempty"`
+// CompiledMatch holds immutable match criteria with parsed selectors for repeated matching.
+// +kubebuilder:object:generate=false
+type CompiledMatch struct {
+	match                *Match
+	labelSelector        labels.Selector
+	namespaceSelector    labels.Selector
+	hasLabelSelector     bool
+	hasNamespaceSelector bool
 }
 
-// Kinds accepts a list of objects with apiGroups and kinds fields
-// that list the groups/kinds of objects to which the mutation will apply.
-// If multiple groups/kinds objects are specified,
-// only one match is needed for the resource to be in scope.
-// +kubebuilder:object:generate=true
-type Kinds struct {
-	// APIGroups is the API groups the resources belong to. '*' is all groups.
-	// If '*' is present, the length of the slice must be one.
-	// Required.
-	APIGroups []string `json:"apiGroups,omitempty" protobuf:"bytes,1,rep,name=apiGroups"`
-	Kinds     []string `json:"kinds,omitempty"`
+// Compile parses selector criteria once so a match can be reused on hot paths.
+func Compile(match *Match) (*CompiledMatch, error) {
+	return compileMatch(match, true)
+}
+
+func compileMatch(match *Match, snapshot bool) (*CompiledMatch, error) {
+	if match == nil {
+		match = &Match{}
+	}
+	if snapshot {
+		match = match.DeepCopy()
+	}
+
+	compiled := &CompiledMatch{match: match}
+	if match.LabelSelector != nil {
+		selector, err := metav1.LabelSelectorAsSelector(match.LabelSelector)
+		if err != nil {
+			return nil, err
+		}
+		compiled.labelSelector = selector
+		compiled.hasLabelSelector = true
+	}
+	if match.NamespaceSelector != nil {
+		selector, err := metav1.LabelSelectorAsSelector(match.NamespaceSelector)
+		if err != nil {
+			return nil, err
+		}
+		compiled.namespaceSelector = selector
+		compiled.hasNamespaceSelector = true
+	}
+
+	return compiled, nil
 }
 
 // Matches verifies if the given object belonging to the given namespace
-// matches the current mutator.
-func Matches(match *Match, obj runtime.Object, ns *corev1.Namespace) (bool, error) {
-	meta, err := meta.Accessor(obj)
+// matches Match. Only returns true if all parts of the Match succeed.
+func Matches(match *Match, target *Matchable) (bool, error) {
+	if err := validateTarget(target); err != nil {
+		return false, err
+	}
+	compiled, err := compileMatch(match, false)
 	if err != nil {
-		return false, fmt.Errorf("accessor failed for %s", obj.GetObjectKind().GroupVersionKind().Kind)
+		return false, fmt.Errorf("%w: %w", ErrMatch, err)
+	}
+	return compiled.Matches(target)
+}
+
+func validateTarget(target *Matchable) error {
+	if target == nil || reflect.ValueOf(target.Object).IsNil() {
+		// Simply checking if obj == nil is insufficient here.
+		// obj can be an interface pointer to nil, such as client.Object(nil), which
+		// is not equal to just "nil".
+		return fmt.Errorf("%w: obj must be non-nil", ErrMatch)
+	}
+	return nil
+}
+
+func (m *CompiledMatch) Matches(target *Matchable) (bool, error) {
+	if err := validateTarget(target); err != nil {
+		return false, err
 	}
 
-	if isNamespace(obj) && ns == nil {
-		return false, errors.New("invalid call to Matches(), ns must not be nil for Namespace objects")
+	// We fail the match if any of these returns false.
+	topLevelMatchers := []compiledMatchFunc{
+		compiledKindsMatch,
+		compiledScopeMatch,
+		compiledNamespacesMatch,
+		compiledExcludedNamespacesMatch,
+		compiledLabelSelectorMatch,
+		compiledNamespaceSelectorMatch,
+		compiledNamesMatch,
+		compiledSourceMatch,
 	}
 
-	foundMatch := false
-
-	for _, kk := range match.Kinds {
-		kindMatches := false
-		groupMatches := false
-
-		for _, k := range kk.Kinds {
-			if k == "*" || k == obj.GetObjectKind().GroupVersionKind().Kind {
-				kindMatches = true
-				break
-			}
+	for _, fn := range topLevelMatchers {
+		matches, err := fn(m, target)
+		if err != nil {
+			return false, fmt.Errorf("%w: %w", ErrMatch, err)
 		}
-		if len(kk.Kinds) == 0 {
-			kindMatches = true
-		}
 
-		for _, g := range kk.APIGroups {
-			if g == "*" || g == obj.GetObjectKind().GroupVersionKind().Group {
-				groupMatches = true
-				break
-			}
-		}
-		if len(kk.APIGroups) == 0 {
-			groupMatches = true
-		}
-
-		if kindMatches && groupMatches {
-			foundMatch = true
-		}
-	}
-	if len(match.Kinds) == 0 {
-		foundMatch = true
-	}
-
-	if !foundMatch {
-		return false, nil
-	}
-
-	clusterScoped := ns == nil || isNamespace(obj)
-
-	if match.Scope == apiextensionsv1.ClusterScoped &&
-		!clusterScoped {
-		return false, nil
-	}
-
-	if match.Scope == apiextensionsv1.NamespaceScoped &&
-		clusterScoped {
-		return false, nil
-	}
-
-	if ns != nil {
-		found := false
-		for _, n := range match.Namespaces {
-			if ns.Name == n {
-				found = true
-				break
-			}
-		}
-		if !found && len(match.Namespaces) > 0 {
+		if !matches {
+			// One of the matchers didn't match, so we can exit early.
 			return false, nil
-		}
-
-		for _, n := range match.ExcludedNamespaces {
-			if ns.Name == n {
-				return false, nil
-			}
-		}
-		if match.LabelSelector != nil {
-			selector, err := metav1.LabelSelectorAsSelector(match.LabelSelector)
-			if err != nil {
-				return false, err
-			}
-			if !selector.Matches(labels.Set(meta.GetLabels())) {
-				return false, nil
-			}
-		}
-
-		if match.NamespaceSelector != nil {
-			selector, err := metav1.LabelSelectorAsSelector(match.NamespaceSelector)
-			if err != nil {
-				return false, err
-			}
-
-			switch {
-			case isNamespace(obj): // if the object is a namespace, namespace selector matches against the object
-				if !selector.Matches(labels.Set(meta.GetLabels())) {
-					return false, nil
-				}
-			case clusterScoped:
-				// cluster scoped, matches by default
-			case !selector.Matches(labels.Set(ns.Labels)):
-				return false, nil
-			}
 		}
 	}
 
 	return true, nil
 }
 
-// AppliesTo checks if any item the given slice of ApplyTo applies to the given object
-func AppliesTo(applyTo []ApplyTo, obj runtime.Object) bool {
-	gvk := obj.GetObjectKind().GroupVersionKind()
-	for _, apply := range applyTo {
-		matchesGroup := false
-		matchesVersion := false
-		matchesKind := false
+// compiledMatchFunc defines the matching logic of a Top Level Matcher. A TLM receives
+// compiled match criteria, an object, and the namespace of the object and decides if
+// there is a reason why the object does not match. If the TLM associated with the
+// matching function is not defined by the user, the compiledMatchFunc should return true.
+type (
+	compiledMatchFunc func(match *CompiledMatch, target *Matchable) (bool, error)
+)
 
-		for _, g := range apply.Groups {
-			if g == gvk.Group {
-				matchesGroup = true
-				break
-			}
+func compiledKindsMatch(match *CompiledMatch, target *Matchable) (bool, error) {
+	return kindsMatch(match.match, target)
+}
+
+func compiledScopeMatch(match *CompiledMatch, target *Matchable) (bool, error) {
+	return scopeMatch(match.match, target)
+}
+
+func compiledNamespacesMatch(match *CompiledMatch, target *Matchable) (bool, error) {
+	return namespacesMatch(match.match, target)
+}
+
+func compiledExcludedNamespacesMatch(match *CompiledMatch, target *Matchable) (bool, error) {
+	return excludedNamespacesMatch(match.match, target)
+}
+
+func compiledNamesMatch(match *CompiledMatch, target *Matchable) (bool, error) {
+	return namesMatch(match.match, target)
+}
+
+func compiledSourceMatch(match *CompiledMatch, target *Matchable) (bool, error) {
+	return sourceMatch(match.match, target)
+}
+
+func compiledNamespaceSelectorMatch(match *CompiledMatch, target *Matchable) (bool, error) {
+	obj := target.Object
+	ns := target.Namespace
+
+	if !match.hasNamespaceSelector {
+		return true, nil
+	}
+
+	isNamespace := IsNamespace(obj)
+	if !isNamespace && ns == nil && obj.GetNamespace() == "" {
+		// Match all non-Namespace cluster-scoped objects.
+		return true, nil
+	}
+
+	if isNamespace {
+		return match.namespaceSelector.Matches(labels.Set(obj.GetLabels())), nil
+	}
+
+	if ns == nil {
+		return false, fmt.Errorf("namespace selector for namespace-scoped object but missing Namespace")
+	}
+
+	return match.namespaceSelector.Matches(labels.Set(ns.Labels)), nil
+}
+
+func compiledLabelSelectorMatch(match *CompiledMatch, target *Matchable) (bool, error) {
+	obj := target.Object
+
+	if !match.hasLabelSelector {
+		return true, nil
+	}
+
+	return match.labelSelector.Matches(labels.Set(obj.GetLabels())), nil
+}
+
+func excludedNamespacesMatch(match *Match, target *Matchable) (bool, error) {
+	obj := target.Object
+	ns := target.Namespace
+
+	// If we don't have a namespace, we can't disqualify the match
+	var namespace string
+
+	switch {
+	case len(match.ExcludedNamespaces) == 0:
+		return true, nil
+	case IsNamespace(obj):
+		namespace = obj.GetName()
+	case ns != nil:
+		namespace = ns.Name
+	case obj.GetNamespace() != "":
+		// Fall back to the Namespace the Object declares in case it isn't specified,
+		// such as for the gator CLI.
+		namespace = obj.GetNamespace()
+	default:
+		// obj is cluster-scoped and not a Namespace.
+		return true, nil
+	}
+
+	for _, n := range match.ExcludedNamespaces {
+		if n.Matches(namespace) {
+			return false, nil
 		}
-		for _, g := range apply.Versions {
-			if g == gvk.Version {
-				matchesVersion = true
-				break
-			}
+	}
+
+	return true, nil
+}
+
+func namespacesMatch(match *Match, target *Matchable) (bool, error) {
+	obj := target.Object
+	ns := target.Namespace
+
+	// If we don't have a namespace, we can't disqualify the match
+	var namespace string
+
+	switch {
+	case len(match.Namespaces) == 0:
+		return true, nil
+	case IsNamespace(obj):
+		namespace = obj.GetName()
+	case ns != nil:
+		namespace = ns.Name
+	case obj.GetNamespace() != "":
+		// Fall back to the Namespace the Object declares in case it isn't specified,
+		// such as for the gator CLI.
+		namespace = obj.GetNamespace()
+	default:
+		return true, nil
+	}
+
+	for _, n := range match.Namespaces {
+		if n.Matches(namespace) {
+			return true, nil
 		}
-		for _, g := range apply.Kinds {
-			if g == gvk.Kind {
-				matchesKind = true
-				break
-			}
+	}
+
+	return false, nil
+}
+
+func kindsMatch(match *Match, target *Matchable) (bool, error) {
+	if len(match.Kinds) == 0 {
+		return true, nil
+	}
+
+	gvk := target.Object.GetObjectKind().GroupVersionKind()
+
+	for _, kk := range match.Kinds {
+		kindMatches := len(kk.Kinds) == 0 || contains(kk.Kinds, Wildcard) || contains(kk.Kinds, gvk.Kind)
+		if !kindMatches {
+			continue
 		}
-		if matchesGroup &&
-			matchesVersion &&
-			matchesKind {
+
+		groupMatches := len(kk.APIGroups) == 0 || contains(kk.APIGroups, Wildcard) || contains(kk.APIGroups, gvk.Group)
+		if groupMatches {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+func namesMatch(match *Match, target *Matchable) (bool, error) {
+	// A blank string could be undefined or an intentional blank string by the user.  Either way,
+	// we will assume this means "any name".  This goes with the undefined == match everything
+	// pattern that we've already got going in the Match.
+	if match.Name == "" {
+		return true, nil
+	}
+
+	return match.Name.Matches(target.Object.GetName()) || match.Name.MatchesGenerateName(target.Object.GetGenerateName()), nil
+}
+
+func scopeMatch(match *Match, target *Matchable) (bool, error) {
+	hasNamespace := target.Object.GetNamespace() != "" || target.Namespace != nil
+	isNamespace := IsNamespace(target.Object)
+
+	switch match.Scope {
+	case apiextensionsv1.ClusterScoped:
+		return isNamespace || !hasNamespace, nil
+	case apiextensionsv1.NamespaceScoped:
+		return !isNamespace && hasNamespace, nil
+	default:
+		// This includes invalid scopes, such as typos like "cluster" or "Namespace".
+		return true, nil
+	}
+}
+
+func sourceMatch(match *Match, target *Matchable) (bool, error) {
+	mSrc := types.SourceType(match.Source)
+	tSrc := target.Source
+
+	// An empty 'source' field will default to 'All'
+	if mSrc == "" {
+		mSrc = types.SourceTypeDefault
+	} else if !types.IsValidSource(mSrc) {
+		return false, fmt.Errorf("invalid source field %q", mSrc)
+	}
+
+	if tSrc == "" && mSrc != types.SourceTypeAll {
+		return false, fmt.Errorf("source field not specified for resource %s", target.Object.GetName())
+	}
+
+	if mSrc == types.SourceTypeAll {
+		return true, nil
+	}
+
+	if !types.IsValidSource(tSrc) {
+		return false, fmt.Errorf("invalid source field %q", tSrc)
+	}
+
+	return mSrc == tSrc, nil
+}
+
+func IsNamespace(obj client.Object) bool {
+	return obj.GetObjectKind().GroupVersionKind().Kind == "Namespace" &&
+		obj.GetObjectKind().GroupVersionKind().Group == ""
+}
+
+// contains returns true is element is in set.
+func contains(set []string, element string) bool {
+	for _, s := range set {
+		if s == element {
 			return true
 		}
 	}
 	return false
-}
-
-func isNamespace(obj runtime.Object) bool {
-	return obj.GetObjectKind().GroupVersionKind().Kind == "Namespace" &&
-		obj.GetObjectKind().GroupVersionKind().Group == ""
 }

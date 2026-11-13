@@ -1,114 +1,246 @@
 package audit
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"testing"
 	"time"
 
-	"go.opencensus.io/stats/view"
+	exportutil "github.com/open-policy-agent/gatekeeper/v3/pkg/export/util"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/util"
+	testmetric "github.com/open-policy-agent/gatekeeper/v3/test/metrics"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata/metricdatatest"
 )
 
-func TestReportTotalViolations(t *testing.T) {
-	const expectedValue int64 = 10
-	const expectedRowLength = 1
-	expectedTags := map[string]string{
-		"enforcement_action": "deny",
+func initializeTestInstruments(t *testing.T) (rdr *sdkmetric.PeriodicReader, r *reporter) {
+	var err error
+	r, err = newStatsReporter()
+	assert.NoError(t, err)
+	rdr = sdkmetric.NewPeriodicReader(new(testmetric.FnExporter))
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(rdr))
+	meter := mp.Meter("test")
+
+	_, err = meter.Int64ObservableGauge(violationsMetricName, metric.WithInt64Callback(r.observeTotalViolations))
+	assert.NoError(t, err)
+	auditDurationM, err = meter.Float64Histogram(auditDurationMetricName)
+	assert.NoError(t, err)
+	_, err = meter.Float64ObservableGauge(lastRunStartTimeMetricName, metric.WithFloat64Callback(r.observeRunStart))
+	assert.NoError(t, err)
+	_, err = meter.Float64ObservableGauge(lastRunEndTimeMetricName, metric.WithFloat64Callback(r.observeRunEnd))
+	assert.NoError(t, err)
+
+	return rdr, r
+}
+
+func TestReporter_observeTotalViolations(t *testing.T) {
+	tests := []struct {
+		name        string
+		ctx         context.Context
+		expectedErr error
+		want        metricdata.Metrics
+	}{
+		{
+			name:        "reporting total violations with attributes",
+			ctx:         context.Background(),
+			expectedErr: nil,
+			want: metricdata.Metrics{
+				Name: violationsMetricName,
+				Data: metricdata.Gauge[int64]{
+					DataPoints: []metricdata.DataPoint[int64]{
+						{Attributes: attribute.NewSet(attribute.String(enforcementActionKey, string(util.Deny))), Value: 1},
+						{Attributes: attribute.NewSet(attribute.String(enforcementActionKey, string(util.Dryrun))), Value: 2},
+						{Attributes: attribute.NewSet(attribute.String(enforcementActionKey, string(util.Warn))), Value: 3},
+						{Attributes: attribute.NewSet(attribute.String(enforcementActionKey, string(util.Unrecognized))), Value: 4},
+					},
+				},
+			},
+		},
 	}
 
-	r, err := newStatsReporter()
-	if err != nil {
-		t.Errorf("newStatsReporter() error %v", err)
-	}
-	err = r.reportTotalViolations("deny", expectedValue)
-	if err != nil {
-		t.Errorf("ReportTotalViolations error %v", err)
-	}
-	row := checkData(t, violationsMetricName, expectedRowLength)
-	value, ok := row.Data.(*view.LastValueData)
-	if !ok {
-		t.Error("ReportTotalViolations should have aggregation LastValue()")
-	}
-	for _, tag := range row.Tags {
-		if tag.Value != expectedTags[tag.Key.Name()] {
-			t.Errorf("ReportTotalViolations tags does not match for %v", tag.Key.Name())
-		}
-	}
-	if int64(value.Value) != expectedValue {
-		t.Errorf("Metric: %v - Expected %v, got %v", violationsMetricName, value.Value, expectedValue)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			totalViolationsPerEnforcementAction := map[util.EnforcementAction]int64{
+				util.Deny:         1,
+				util.Dryrun:       2,
+				util.Warn:         3,
+				util.Unrecognized: 4,
+			}
+			rdr, r := initializeTestInstruments(t)
+
+			for k, v := range totalViolationsPerEnforcementAction {
+				assert.NoError(t, r.reportTotalViolations(k, v))
+			}
+
+			rm := &metricdata.ResourceMetrics{}
+			assert.Equal(t, tt.expectedErr, rdr.Collect(tt.ctx, rm))
+
+			metricdatatest.AssertEqual(t, tt.want, rm.ScopeMetrics[0].Metrics[0], metricdatatest.IgnoreTimestamp())
+		})
 	}
 }
 
-func TestReportLatency(t *testing.T) {
-	const expectedLatencyValueMin = time.Duration(100 * time.Second)
-	const expectedLatencyValueMax = time.Duration(500 * time.Second)
-	const expectedLatencyCount int64 = 2
-	const expectedLatencyMin float64 = 100
-	const expectedLatencyMax float64 = 500
-	const expectedRowLength = 1
+func TestReporter_reportLatency(t *testing.T) {
+	tests := []struct {
+		name        string
+		ctx         context.Context
+		expectedErr error
+		want        metricdata.Metrics
+		r           *reporter
+		duration    time.Duration
+	}{
+		{
+			name:        "reporting audit latency",
+			ctx:         context.Background(),
+			expectedErr: nil,
+			duration:    7000000000,
+			want: metricdata.Metrics{
+				Name: auditDurationMetricName,
+				Data: metricdata.Histogram[float64]{
+					Temporality: metricdata.CumulativeTemporality,
+					DataPoints: []metricdata.HistogramDataPoint[float64]{
+						{
+							Attributes:   attribute.Set{},
+							Count:        1,
+							Bounds:       []float64{0, 5, 10, 25, 50, 75, 100, 250, 500, 750, 1000, 2500, 5000, 7500, 10000},
+							BucketCounts: []uint64{0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+							Min:          metricdata.NewExtrema[float64](7.),
+							Max:          metricdata.NewExtrema[float64](7.),
+							Sum:          7,
+						},
+					},
+				},
+			},
+		},
+	}
 
-	r, err := newStatsReporter()
-	if err != nil {
-		t.Errorf("newStatsReporter() error %v", err)
-	}
-	err = r.reportLatency(expectedLatencyValueMin)
-	if err != nil {
-		t.Errorf("ReportLatency error %v", err)
-	}
-	err = r.reportLatency(expectedLatencyValueMax)
-	if err != nil {
-		t.Errorf("ReportLatency error %v", err)
-	}
-	row := checkData(t, auditDurationMetricName, expectedRowLength)
-	latencyValue, ok := row.Data.(*view.DistributionData)
-	if !ok {
-		t.Error("ReportLatency should have aggregation type Distribution")
-	}
-	if latencyValue.Count != expectedLatencyCount {
-		t.Errorf("Metric: %v - Expected %v, got %v", auditDurationMetricName, latencyValue.Count, expectedLatencyCount)
-	}
-	if latencyValue.Min != expectedLatencyMin {
-		t.Errorf("Metric: %v - Expected %v, got %v", auditDurationMetricName, latencyValue.Min, expectedLatencyMin)
-	}
-	if latencyValue.Max != expectedLatencyMax {
-		t.Errorf("Metric: %v - Expected %v, got %v", auditDurationMetricName, latencyValue.Max, expectedLatencyMax)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rdr, r := initializeTestInstruments(t)
+			assert.NoError(t, r.reportLatency(tt.duration))
+
+			rm := &metricdata.ResourceMetrics{}
+			assert.Equal(t, tt.expectedErr, rdr.Collect(tt.ctx, rm))
+			metricdatatest.AssertEqual(t, tt.want, rm.ScopeMetrics[0].Metrics[0], metricdatatest.IgnoreTimestamp())
+		})
 	}
 }
 
-func checkData(t *testing.T, name string, expectedRowLength int) *view.Row {
-	row, err := view.RetrieveData(name)
-	if err != nil {
-		t.Errorf("Error when retrieving data: %v from %v", err, name)
+func TestReporter_observeRunStart(t *testing.T) {
+	startTime := time.Now()
+	tests := []struct {
+		name        string
+		ctx         context.Context
+		expectedErr error
+		want        metricdata.Metrics
+		r           *reporter
+	}{
+		{
+			name:        "reporting audit start time",
+			ctx:         context.Background(),
+			expectedErr: nil,
+			want: metricdata.Metrics{
+				Name: lastRunStartTimeMetricName,
+				Data: metricdata.Gauge[float64]{
+					DataPoints: []metricdata.DataPoint[float64]{
+						{Value: float64(startTime.Unix())},
+					},
+				},
+			},
+		},
 	}
-	if len(row) != expectedRowLength {
-		t.Errorf("Expected length %v, got %v", expectedRowLength, len(row))
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rdr, r := initializeTestInstruments(t)
+			assert.NoError(t, r.reportRunStart(startTime))
+
+			rm := &metricdata.ResourceMetrics{}
+			assert.Equal(t, tt.expectedErr, rdr.Collect(tt.ctx, rm))
+
+			metricdatatest.AssertEqual(t, tt.want, rm.ScopeMetrics[0].Metrics[0], metricdatatest.IgnoreTimestamp())
+		})
 	}
-	if row[0].Data == nil {
-		t.Errorf("Expected row data not to be nil")
-	}
-	return row[0]
 }
 
-func TestLastRestartCheck(t *testing.T) {
-	expectedTime := time.Now()
-	expectedTs := float64(expectedTime.UnixNano()) / 1e9
-	const expectedRowLength = 1
+func TestReporter_observeRunEnd(t *testing.T) {
+	endTime := time.Now()
+	tests := []struct {
+		name        string
+		ctx         context.Context
+		expectedErr error
+		want        metricdata.Metrics
+	}{
+		{
+			name:        "reporting audit end time",
+			ctx:         context.Background(),
+			expectedErr: nil,
+			want: metricdata.Metrics{
+				Name: lastRunEndTimeMetricName,
+				Data: metricdata.Gauge[float64]{
+					DataPoints: []metricdata.DataPoint[float64]{
+						{Value: float64(endTime.Unix())},
+					},
+				},
+			},
+		},
+	}
 
-	r, err := newStatsReporter()
-	if err != nil {
-		t.Errorf("newStatsReporter() error %v", err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rdr, r := initializeTestInstruments(t)
+			assert.NoError(t, r.reportRunEnd(endTime))
+
+			rm := &metricdata.ResourceMetrics{}
+			assert.Equal(t, tt.expectedErr, rdr.Collect(tt.ctx, rm))
+			fmt.Println(rm.ScopeMetrics[0])
+			metricdatatest.AssertEqual(t, tt.want, rm.ScopeMetrics[0].Metrics[1], metricdatatest.IgnoreTimestamp())
+		})
 	}
-	err = r.reportRunStart(expectedTime)
-	if err != nil {
-		t.Errorf("reportRunStart error %v", err)
-	}
-	row := checkData(t, lastRunTimeMetricName, expectedRowLength)
-	value, ok := row.Data.(*view.LastValueData)
-	if !ok {
-		t.Error("lastRunTimeMetricName should have aggregation LastValue()")
-	}
-	if len(row.Tags) != 0 {
-		t.Errorf("lastRunTimeMetricName tags is non-empty, got: %v", row.Tags)
-	}
-	if value.Value != expectedTs {
-		t.Errorf("Metric: %v - Expected %v, got %v", lastRunTimeMetricName, expectedTs, value.Value)
+}
+
+func TestAuditExportMetrics(t *testing.T) {
+	oldExportEnabled := *exportutil.ExportEnabled
+	t.Cleanup(func() { *exportutil.ExportEnabled = oldExportEnabled })
+
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("export enabled %t", enabled), func(t *testing.T) {
+			*exportutil.ExportEnabled = enabled
+			rdr := sdkmetric.NewManualReader()
+			meter := sdkmetric.NewMeterProvider(sdkmetric.WithReader(rdr)).Meter("test")
+			r := &reporter{}
+			require.NoError(t, registerAuditExportMetrics(meter, r))
+			collect := func() map[string]int64 {
+				rm := metricdata.ResourceMetrics{}
+				require.NoError(t, rdr.Collect(context.Background(), &rm))
+				values := map[string]int64{}
+				for _, scope := range rm.ScopeMetrics {
+					for _, m := range scope.Metrics {
+						sum, ok := m.Data.(metricdata.Sum[int64])
+						require.True(t, ok)
+						values[m.Name] = sum.DataPoints[0].Value
+					}
+				}
+				return values
+			}
+			want := func(published, publishErrors int64) map[string]int64 {
+				if !enabled {
+					return map[string]int64{}
+				}
+				return map[string]int64{auditExportPublishedMetricName: published, auditExportPublishErrorMetricName: publishErrors}
+			}
+
+			require.Equal(t, want(0, 0), collect())
+			r.reportAuditExportPublish(nil)
+			r.reportAuditExportPublish(nil)
+			r.reportAuditExportPublish(errors.New("publish failed"))
+			require.Equal(t, want(2, 1), collect())
+		})
 	}
 }

@@ -7,13 +7,9 @@ title: Installation
 
 ### Minimum Kubernetes Version
 
-**To use Gatekeeper, you should have a minimum Kubernetes version of 1.14, which adds
-webhook timeouts.**
+The minimum supported Kubernetes version for Gatekeeper is aligned with the Kubernetes releases listed in the [Kubernetes Supported Versions policy](https://kubernetes.io/releases/version-skew-policy/). For more information, please see [supported Kubernetes versions](https://github.com/open-policy-agent/gatekeeper/blob/master/docs/Release_Management.md#supported-kubernetes-versions).
 
-You can install Gatekeeper in earlier versions of Kubernetes either by
-removing incompatible fields from the manifest or by setting `--validate=false`
-when applying the manifest. Be warned that, without timeouts on the webhook, your
-API Server could timeout when Gatekeeper is down. Kubernetes 1.14 fixes this issue.
+**Note:** Gatekeeper requires resources introduced in Kubernetes v1.16.
 
 ### RBAC Permissions
 
@@ -32,7 +28,7 @@ For either installation method, make sure you have cluster admin permissions:
 If you want to deploy a released version of Gatekeeper in your cluster with a prebuilt image, then you can run the following command:
 
 ```sh
-kubectl apply -f https://raw.githubusercontent.com/open-policy-agent/gatekeeper/release-3.5/deploy/gatekeeper.yaml
+kubectl apply -f https://raw.githubusercontent.com/open-policy-agent/gatekeeper/master/deploy/gatekeeper.yaml
 ```
 
 ### Deploying a Release using development image
@@ -46,27 +42,28 @@ Images are hosted in [OPA Docker Hub repository](https://hub.docker.com/r/openpo
 Currently the most reliable way of installing Gatekeeper is to build and install from HEAD:
 
    * Make sure that:
-       * You have Docker version 19.03 or later installed.
-       * [Kubebuilder](https://github.com/kubernetes-sigs/kubebuilder#getting-started) and [Kustomize](https://kubectl.docs.kubernetes.io/installation/kustomize/) are installed.
+       * You have [Docker](https://docs.docker.com/engine/install/) version 20.10 or later installed.
        * Your kubectl context is set to the desired installation cluster.
        * You have a container registry you can write to that is readable by the target cluster.
+
    * Clone the Gatekeeper repository to your local system:
      ```sh
      git clone https://github.com/open-policy-agent/gatekeeper.git
      ```
+
    * `cd` to the repository directory.
-   * Define your destination Docker image location:
+
+   * Build and push Gatekeeper image:
       ```sh
-      export DESTINATION_GATEKEEPER_DOCKER_IMAGE=<YOUR DESIRED DESTINATION DOCKER IMAGE>
+      export DESTINATION_GATEKEEPER_IMAGE=<add registry like "myregistry.docker.io/gatekeeper">
+      make docker-buildx REPOSITORY=$DESTINATION_GATEKEEPER_IMAGE OUTPUT_TYPE=type=registry
       ```
-   * Build and push your Docker image:
-      ```sh
-      make docker-buildx REPOSITORY="$DESTINATION_GATEKEEPER_DOCKER_IMAGE"
-      make docker-push REPOSITORY="$DESTINATION_GATEKEEPER_DOCKER_IMAGE"
-      ```
+
+      > If you want to use a local image, don't set OUTPUT_TYPE and it will default to `OUTPUT_TYPE=type=docker`.
+
    * Finally, deploy:
      ```sh
-     make deploy REPOSITORY="$DESTINATION_GATEKEEPER_DOCKER_IMAGE"
+     make deploy REPOSITORY=$DESTINATION_GATEKEEPER_IMAGE
      ```
 
 ### Deploying via Helm
@@ -75,7 +72,7 @@ A basic Helm chart exists in `charts/gatekeeper`. If you have Helm installed, yo
 
 ```sh
 helm repo add gatekeeper https://open-policy-agent.github.io/gatekeeper/charts
-helm install gatekeeper/gatekeeper --generate-name
+helm install gatekeeper/gatekeeper --name-template=gatekeeper --namespace gatekeeper-system --create-namespace
 ```
 
 If you are using the older Gatekeeper Helm repo location and Helm v3.3.2+, then use `force-update` to override the default behavior to update the existing repo.
@@ -88,6 +85,43 @@ Please note that this chart is compatible with Helm v3 starting with Gatekeeper 
 
 You can alter the variables in `charts/gatekeeper/values.yaml` to customize your deployment. To regenerate the base template, run `make manifests`.
 
+### Configuring Pod Annotations for Cluster Autoscaler
+
+If you are using the [Kubernetes Cluster Autoscaler](https://github.com/kubernetes/autoscaler/tree/master/cluster-autoscaler), you may want to allow downscaling of nodes running Gatekeeper pods. Since the Gatekeeper audit pod uses an `emptyDir` volume named `tmp-volume` for `/tmp/audit`, the Cluster Autoscaler will block node downscaling by default.
+
+To enable safe eviction for the audit pod, you can pass the `safe-to-evict` pod annotation via Helm:
+
+```sh
+helm upgrade --install gatekeeper gatekeeper/gatekeeper \
+    --namespace gatekeeper-system \
+    --create-namespace \
+    --set-string \
+    'auditPodAnnotations.cluster-autoscaler\.kubernetes\.io/safe-to-evict-local-volumes=tmp-volume'
+```
+
+:::warning
+When violation export is enabled with exportBackend=disk, the audit pod has
+another local volume, named `tmp-violations` by default. It contains audit
+results being handed from Gatekeeper to the export sidecar. Do not include
+this volume in safe-to-evict-local-volumes unless losing incomplete or
+unconsumed export files during pod eviction is acceptable.
+
+To explicitly allow eviction despite both local volumes:
+
+```sh
+helm upgrade --install gatekeeper gatekeeper/gatekeeper \
+    --namespace gatekeeper-system \
+    --create-namespace \
+    --set enableViolationExport=true \
+    --set exportBackend=disk \
+    --set-string \
+    'auditPodAnnotations.cluster-autoscaler\.kubernetes\.io/safe-to-evict-local-volumes=tmp-volume\,tmp-violations'
+```
+
+If `audit.exportVolume.name` is customized, use that volume name instead of
+`tmp-violations`.
+:::
+
 ## Uninstallation
 
 ### Using Prebuilt Image
@@ -95,7 +129,7 @@ You can alter the variables in `charts/gatekeeper/values.yaml` to customize your
 If you used a prebuilt image to deploy Gatekeeper, then you can delete all the Gatekeeper components with the following command:
 
   ```sh
-  kubectl delete -f https://raw.githubusercontent.com/open-policy-agent/gatekeeper/release-3.5/deploy/gatekeeper.yaml
+  kubectl delete -f https://raw.githubusercontent.com/open-policy-agent/gatekeeper/master/deploy/gatekeeper.yaml
   ```
 
 ### Using make
@@ -109,7 +143,7 @@ If you used `make` to deploy, then run the following to uninstall Gatekeeper:
 
 If you used `helm` to deploy, then run the following to uninstall Gatekeeper:
 ```sh
-helm delete <release name>
+helm delete gatekeeper --namespace gatekeeper-system
 ```
 
 Helm v3 will not cleanup Gatekeeper installed CRDs. Run the following to uninstall Gatekeeper CRDs:

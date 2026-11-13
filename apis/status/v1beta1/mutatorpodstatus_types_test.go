@@ -1,50 +1,72 @@
-package v1beta1
+package v1beta1_test
 
 import (
-	"os"
 	"testing"
 
-	. "github.com/onsi/gomega"
-	"github.com/open-policy-agent/gatekeeper/pkg/mutation/mutators/testhelpers"
-	"github.com/open-policy-agent/gatekeeper/pkg/operations"
+	"github.com/google/go-cmp/cmp"
+	"github.com/open-policy-agent/gatekeeper/v3/apis/status/v1beta1"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/fakes"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/mutation/mutators/testhelpers"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/operations"
+	"github.com/open-policy-agent/gatekeeper/v3/test/testutils"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
 func TestNewMutatorStatusForPod(t *testing.T) {
-	g := NewGomegaWithT(t)
 	podName := "some-gk-pod-m"
 	podNS := "a-gk-namespace-m"
 	mutator := testhelpers.NewDummyMutator("a-mutator", "spec.value", nil)
-	os.Setenv("POD_NAMESPACE", podNS)
-	defer os.Unsetenv("POD_NAMESPACE")
+	testutils.Setenv(t, "POD_NAMESPACE", podNS)
 
 	scheme := runtime.NewScheme()
-	g.Expect(AddToScheme(scheme)).NotTo(HaveOccurred())
-	g.Expect(corev1.AddToScheme(scheme)).NotTo(HaveOccurred())
+	err := v1beta1.AddToScheme(scheme)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	pod := &corev1.Pod{}
-	pod.SetName(podName)
-	pod.SetNamespace(podNS)
+	err = corev1.AddToScheme(scheme)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	expectedStatus := &MutatorPodStatus{}
+	pod := fakes.Pod(
+		fakes.WithNamespace(podNS),
+		fakes.WithName(podName),
+	)
+
+	expectedStatus := &v1beta1.MutatorPodStatus{}
 	expectedStatus.SetName("some--gk--pod--m-dummymutator-a--mutator")
 	expectedStatus.SetNamespace(podNS)
 	expectedStatus.Status.ID = podName
 	expectedStatus.Status.Operations = operations.AssignedStringList()
 	expectedStatus.SetLabels(
 		map[string]string{
-			MutatorNameLabel: "a-mutator",
-			MutatorKindLabel: "DummyMutator",
-			PodLabel:         podName,
+			v1beta1.MutatorNameLabel: "a-mutator",
+			v1beta1.MutatorKindLabel: "DummyMutator",
+			v1beta1.PodLabel:         podName,
 		})
-	g.Expect(controllerutil.SetOwnerReference(pod, expectedStatus, scheme)).NotTo(HaveOccurred())
 
-	status, err := NewMutatorStatusForPod(pod, mutator.ID(), scheme)
-	g.Expect(err).NotTo(HaveOccurred())
-	g.Expect(status).To(Equal(expectedStatus))
-	cmVal, err := KeyForMutatorID(podName, mutator.ID())
-	g.Expect(err).NotTo(HaveOccurred())
-	g.Expect(status.Name).To(Equal(cmVal))
+	err = controllerutil.SetOwnerReference(pod, expectedStatus, scheme)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	status, err := v1beta1.NewMutatorStatusForPod(pod, mutator.ID(), scheme)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if diff := cmp.Diff(expectedStatus, status); diff != "" {
+		t.Fatal(diff)
+	}
+	cmVal, err := v1beta1.KeyForMutatorID(podName, mutator.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if status.Name != cmVal {
+		t.Fatalf("got status name %q, want %q", status.Name, cmVal)
+	}
 }

@@ -16,15 +16,18 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/open-policy-agent/cert-controller/pkg/rotator"
-	opa "github.com/open-policy-agent/frameworks/constraint/pkg/client"
-	"github.com/open-policy-agent/gatekeeper/apis"
-	"github.com/open-policy-agent/gatekeeper/pkg/controller/config/process"
-	"github.com/open-policy-agent/gatekeeper/pkg/mutation"
-	"github.com/open-policy-agent/gatekeeper/pkg/util"
-	admissionv1 "k8s.io/api/admission/v1"
+	"github.com/open-policy-agent/gatekeeper/v3/apis"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/controller/config/process"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/mutation"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/mutation/match"
+	mutationtypes "github.com/open-policy-agent/gatekeeper/v3/pkg/mutation/types"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/operations"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/util"
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -47,12 +50,16 @@ func init() {
 	}
 }
 
-// TODO enable this once mutation is beta +kubebuilder:webhook:verbs=create;update,path=/v1/mutate,mutating=true,failurePolicy=ignore,groups=*,resources=*,versions=*,name=mutation.gatekeeper.sh,sideEffects=None,admissionReviewVersions=v1;v1beta1,matchPolicy=Exact
-// TODO enable this once mutation is beta +kubebuilder:rbac:groups=*,resources=*,verbs=get;list;watch;update
+// Explicitly list known subresources except "status" and "namespaces/finalize".
+// Status updates increase load, and intercepting namespace finalization can prevent namespace deletion.
+// Keep the existing "services/status" exception consistent with validation.
+// You can find the current list of subresources in the Kubernetes API discovery data.
+// +kubebuilder:webhook:verbs=create;update,path=/v1/mutate,mutating=true,failurePolicy=ignore,groups=*,resources=*;pods/ephemeralcontainers;pods/exec;pods/log;pods/eviction;pods/portforward;pods/proxy;pods/attach;pods/binding;pods/resize;deployments/scale;replicasets/scale;statefulsets/scale;replicationcontrollers/scale;serviceaccounts/token;services/proxy;nodes/proxy;certificatesigningrequests/approval;services/status,versions=*,name=mutation.gatekeeper.sh,sideEffects=None,admissionReviewVersions=v1;v1beta1,matchPolicy=Exact
+// +kubebuilder:rbac:resourceNames=gatekeeper-mutating-webhook-configuration,groups=admissionregistration.k8s.io,resources=mutatingwebhookconfigurations,verbs=get;list;watch;update;patch
 
-// AddMutatingWebhook registers the mutating webhook server with the manager
-func AddMutatingWebhook(mgr manager.Manager, client *opa.Client, processExcluder *process.Excluder, mutationSystem *mutation.System) error {
-	if !*mutation.MutationEnabled {
+// AddMutatingWebhook registers the mutating webhook server with the manager.
+func AddMutatingWebhook(mgr manager.Manager, deps Dependencies) error {
+	if !operations.IsAssigned(operations.MutationWebhook) {
 		return nil
 	}
 	reporter, err := newStatsReporter()
@@ -62,6 +69,7 @@ func AddMutatingWebhook(mgr manager.Manager, client *opa.Client, processExcluder
 	eventBroadcaster := record.NewBroadcaster()
 	kubeClient := kubernetes.NewForConfigOrDie(mgr.GetConfig())
 
+	log := log.WithValues("hookType", "mutation")
 	eventBroadcaster.StartRecordingToSink(&clientcorev1.EventSinkImpl{Interface: kubeClient.CoreV1().Events("")})
 	recorder := eventBroadcaster.NewRecorder(
 		scheme.Scheme,
@@ -73,20 +81,16 @@ func AddMutatingWebhook(mgr manager.Manager, client *opa.Client, processExcluder
 				client:          mgr.GetClient(),
 				reader:          mgr.GetAPIReader(),
 				reporter:        reporter,
-				processExcluder: processExcluder,
+				processExcluder: deps.ProcessExcluder,
 				eventRecorder:   recorder,
 				gkNamespace:     util.GetNamespace(),
 			},
-			mutationSystem: mutationSystem,
+			mutationSystem: deps.MutationSystem,
 			deserializer:   codecs.UniversalDeserializer(),
+			log:            log,
 		},
 	}
 
-	// TODO(https://github.com/open-policy-agent/gatekeeper/issues/661): remove log injection if the race condition in the cited bug is eliminated.
-	// Otherwise we risk having unstable logger names for the webhook.
-	if err := wh.InjectLogger(log); err != nil {
-		return err
-	}
 	mgr.GetWebhookServer().Register("/v1/mutate", wh)
 
 	return nil
@@ -98,32 +102,31 @@ type mutationHandler struct {
 	webhookHandler
 	mutationSystem *mutation.System
 	deserializer   runtime.Decoder
+	log            logr.Logger
 }
 
 // Handle the mutation request
 // nolint: gocritic // Must accept admission.Request to satisfy interface.
 func (h *mutationHandler) Handle(ctx context.Context, req admission.Request) admission.Response {
-	log := log.WithValues("hookType", "mutation")
-	var timeStart = time.Now()
+	timeStart := time.Now()
 
-	if isGkServiceAccount(req.AdmissionRequest.UserInfo) {
-		return admission.ValidationResponse(true, "Gatekeeper does not self-manage")
+	if isGkServiceAccount(req.UserInfo) {
+		return admission.Allowed("Gatekeeper does not self-manage")
 	}
 
-	if req.AdmissionRequest.Operation != admissionv1.Create &&
-		req.AdmissionRequest.Operation != admissionv1.Update {
-		return admission.ValidationResponse(true, "Mutating only on create or update")
+	if !match.IsSupportedMutationOperation(req.Operation) {
+		return admission.Allowed("Mutating only on create or update")
 	}
 
-	if h.isGatekeeperResource(ctx, &req) {
-		return admission.ValidationResponse(true, "Not mutating gatekeeper resources")
+	if h.isGatekeeperResource(&req) {
+		return admission.Allowed("Not mutating gatekeeper resources")
 	}
 
 	requestResponse := unknownResponse
 	defer func() {
 		if h.reporter != nil {
-			if err := h.reporter.ReportMutationRequest(requestResponse, time.Since(timeStart)); err != nil {
-				log.Error(err, "failed to report request")
+			if err := h.reporter.ReportMutationRequest(ctx, requestResponse, time.Since(timeStart)); err != nil {
+				h.log.Error(err, "failed to report request")
 			}
 		}
 	}()
@@ -131,26 +134,20 @@ func (h *mutationHandler) Handle(ctx context.Context, req admission.Request) adm
 	// namespace is excluded from webhook using config
 	isExcludedNamespace, err := h.skipExcludedNamespace(&req.AdmissionRequest, process.Mutation)
 	if err != nil {
-		log.Error(err, "error while excluding namespace")
+		h.log.Error(err, "error while excluding namespace")
 	}
 
 	if isExcludedNamespace {
 		requestResponse = skipResponse
-		return admission.ValidationResponse(true, "Namespace is set to be ignored by Gatekeeper config")
+		return admission.Allowed("Namespace is set to be ignored by Gatekeeper config")
 	}
 
-	resp, err := h.mutateRequest(ctx, &req)
-
-	if err != nil {
-		requestResponse = errorResponse
-		return admission.Errored(int32(http.StatusInternalServerError), err)
-	}
+	resp := h.mutateRequest(ctx, &req)
 	requestResponse = successResponse
 	return resp
 }
 
-func (h *mutationHandler) mutateRequest(ctx context.Context, req *admission.Request) (admission.Response, error) {
-
+func (h *mutationHandler) mutateRequest(ctx context.Context, req *admission.Request) admission.Response {
 	ns := &corev1.Namespace{}
 
 	// if the object being mutated is a namespace itself, we use it as namespace
@@ -159,24 +156,24 @@ func (h *mutationHandler) mutateRequest(ctx context.Context, req *admission.Requ
 		req.Namespace = ""
 		obj, _, err := deserializer.Decode(req.Object.Raw, nil, &corev1.Namespace{})
 		if err != nil {
-			return admission.Errored(int32(http.StatusInternalServerError), err), nil
+			return admission.Errored(int32(http.StatusInternalServerError), err)
 		}
 		ok := false
 		ns, ok = obj.(*corev1.Namespace)
 		if !ok {
-			return admission.Errored(int32(http.StatusInternalServerError), errors.New("failed to cast namespace object")), nil
+			return admission.Errored(int32(http.StatusInternalServerError), errors.New("failed to cast namespace object"))
 		}
-	case req.AdmissionRequest.Namespace != "":
-		if err := h.client.Get(ctx, types.NamespacedName{Name: req.AdmissionRequest.Namespace}, ns); err != nil {
+	case req.Namespace != "":
+		if err := h.client.Get(ctx, types.NamespacedName{Name: req.Namespace}, ns); err != nil {
 			if !k8serrors.IsNotFound(err) {
-				log.Error(err, "error retrieving namespace", "name", req.AdmissionRequest.Namespace)
-				return admission.Errored(int32(http.StatusInternalServerError), err), nil
+				h.log.Error(err, "error retrieving namespace", "name", req.Namespace)
+				return admission.Errored(int32(http.StatusInternalServerError), err)
 			}
 			// bypass cached client and ask api-server directly
-			err = h.reader.Get(ctx, types.NamespacedName{Name: req.AdmissionRequest.Namespace}, ns)
+			err = h.reader.Get(ctx, types.NamespacedName{Name: req.Namespace}, ns)
 			if err != nil {
-				log.Error(err, "error retrieving namespace from API server", "name", req.AdmissionRequest.Namespace)
-				return admission.Errored(int32(http.StatusInternalServerError), err), nil
+				h.log.Error(err, "error retrieving namespace from API server", "name", req.Namespace)
+				return admission.Errored(int32(http.StatusInternalServerError), err)
 			}
 		}
 	default:
@@ -185,34 +182,57 @@ func (h *mutationHandler) mutateRequest(ctx context.Context, req *admission.Requ
 	obj := unstructured.Unstructured{}
 	err := obj.UnmarshalJSON(req.Object.Raw)
 	if err != nil {
-		log.Error(err, "failed to unmarshal", "object", string(req.Object.Raw))
-		return admission.Errored(int32(http.StatusInternalServerError), err), nil
+		h.log.Error(err, "failed to unmarshal", "object", string(req.Object.Raw))
+		return admission.Errored(int32(http.StatusInternalServerError), err)
 	}
 
-	mutated, err := h.mutationSystem.Mutate(&obj, ns)
+	// It is possible for the namespace to not be populated on an object.
+	// Assign the namespace from the request object (which will have the appropriate
+	// value), then restore the original value at the end to avoid sending a namespace patch.
+	oldNS := obj.GetNamespace()
+	obj.SetNamespace(req.Namespace)
+
+	mutable := &mutationtypes.Mutable{
+		Object:    &obj,
+		Namespace: ns,
+		Username:  req.UserInfo.Username,
+		Source:    mutationtypes.SourceTypeOriginal,
+		Operation: req.Operation,
+	}
+	mutated, err := h.mutationSystem.Mutate(ctx, mutable)
 	if err != nil {
-		log.Error(err, "failed to mutate object", "object", string(req.Object.Raw))
-		return admission.Errored(int32(http.StatusInternalServerError), err), nil
+		h.log.Error(err, "failed to mutate object", "object", string(req.Object.Raw))
+		return admission.Errored(int32(http.StatusInternalServerError), err)
 	}
 	if !mutated {
-		return admission.ValidationResponse(true, "Resource was not mutated"), nil
+		return admission.Allowed("Resource was not mutated")
 	}
 
-	newJSON, err := obj.MarshalJSON()
+	mutable.Object.SetNamespace(oldNS)
+
+	newJSON, err := mutable.Object.MarshalJSON()
 	if err != nil {
-		log.Error(err, "failed to marshal mutated object", "object", obj)
-		return admission.Errored(int32(http.StatusInternalServerError), err), nil
+		h.log.Error(err, "failed to marshal mutated object", "object", obj)
+		return admission.Errored(int32(http.StatusInternalServerError), err)
 	}
 	resp := admission.PatchResponseFromRaw(req.Object.Raw, newJSON)
-	return resp, nil
+	return resp
 }
 
 func AppendMutationWebhookIfEnabled(webhooks []rotator.WebhookInfo) []rotator.WebhookInfo {
-	if *mutation.MutationEnabled {
-		return append(webhooks, rotator.WebhookInfo{
-			Name: MwhName,
+	if operations.IsAssigned(operations.MutationWebhook) {
+		webhooks = append(webhooks, rotator.WebhookInfo{
+			Name: *MwhName,
 			Type: rotator.Mutating,
 		})
+		for _, addlMwh := range strings.Split(*AdditionalMwhNamesToRotateCerts, ",") {
+			if addlMwh != *MwhName && addlMwh != "" {
+				webhooks = append(webhooks, rotator.WebhookInfo{
+					Name: addlMwh,
+					Type: rotator.Mutating,
+				})
+			}
+		}
 	}
 	return webhooks
 }

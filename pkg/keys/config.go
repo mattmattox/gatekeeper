@@ -16,9 +16,9 @@ limitations under the License.
 package keys
 
 import (
-	"github.com/open-policy-agent/gatekeeper/pkg/util"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/util"
 	"k8s.io/apimachinery/pkg/types"
 )
 
-// Config resource singleton reference
+// Config resource singleton reference.
 var Config = types.NamespacedName{Namespace: util.GetNamespace(), Name: "config"}

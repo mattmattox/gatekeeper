@@ -17,16 +17,17 @@ package constraintstatus
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"sort"
 
 	"github.com/go-logr/logr"
-	opa "github.com/open-policy-agent/frameworks/constraint/pkg/client"
-	"github.com/open-policy-agent/gatekeeper/apis/status/v1beta1"
-	"github.com/open-policy-agent/gatekeeper/pkg/logging"
-	"github.com/open-policy-agent/gatekeeper/pkg/util"
-	"github.com/open-policy-agent/gatekeeper/pkg/watch"
+	constraintclient "github.com/open-policy-agent/frameworks/constraint/pkg/client"
+	"github.com/open-policy-agent/gatekeeper/v3/apis/status/v1beta1"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/logging"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/operations"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/util"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/watch"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -41,46 +42,53 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/source"
 )
 
-var (
-	log = logf.Log.WithName("controller").WithValues(logging.Process, "constraint_status_controller")
-)
+var log = logf.Log.WithName("controller").WithValues(logging.Process, "constraint_status_controller")
 
 type Adder struct {
-	Opa              *opa.Client
-	WatchManager     *watch.Manager
-	ControllerSwitch *watch.ControllerSwitch
-	Events           <-chan event.GenericEvent
+	CFClient     *constraintclient.Client
+	WatchManager *watch.Manager
+	Events       <-chan event.GenericEvent
+	IfWatching   func(schema.GroupVersionKind, func() error) (bool, error)
 }
 
 // Add creates a new Constraint Status Controller and adds it to the Manager. The Manager will set fields on the Controller
 // and Start it when the Manager is Started.
 func (a *Adder) Add(mgr manager.Manager) error {
-	r := newReconciler(mgr, a.ControllerSwitch)
+	if !operations.IsAssigned(operations.Status) {
+		return nil
+	}
+	r := newReconciler(mgr)
+	if a.Events == nil {
+		r.reader = mgr.GetClient()
+	}
+	if a.IfWatching != nil {
+		r.ifWatching = a.IfWatching
+	}
 	return add(mgr, r, a.Events)
 }
 
-// newReconciler returns a new reconcile.Reconciler
+// newReconciler returns a new reconcile.Reconciler.
 func newReconciler(
 	mgr manager.Manager,
-	cs *watch.ControllerSwitch) reconcile.Reconciler {
+) *ReconcileConstraintStatus {
 	return &ReconcileConstraintStatus{
 		// Separate reader and writer because manager's default client bypasses the cache for unstructured resources.
 		writer:       mgr.GetClient(),
 		statusClient: mgr.GetClient(),
 		reader:       mgr.GetCache(),
 
-		cs:     cs,
-		scheme: mgr.GetScheme(),
-		log:    log,
+		scheme:     mgr.GetScheme(),
+		log:        log,
+		ifWatching: func(_ schema.GroupVersionKind, fn func() error) (bool, error) { return true, fn() },
 	}
 }
 
 type PackerMap func(obj client.Object) []reconcile.Request
 
 // PodStatusToConstraintMapper correlates a ConstraintPodStatus with its corresponding constraint
-// `selfOnly` tells the mapper to only map statuses corresponding to the current pod
-func PodStatusToConstraintMapper(selfOnly bool, packerMap handler.MapFunc) handler.MapFunc {
-	return func(obj client.Object) []reconcile.Request {
+// `selfOnly` tells the mapper to only map statuses corresponding to the current pod.
+func PodStatusToConstraintMapper(selfOnly bool, packerMap handler.MapFunc) handler.TypedMapFunc[*v1beta1.ConstraintPodStatus, reconcile.Request] {
+	return func(ctx context.Context, obj *v1beta1.ConstraintPodStatus) []reconcile.Request {
 		labels := obj.GetLabels()
 		name, ok := labels[v1beta1.ConstraintNameLabel]
 		if !ok {
@@ -105,12 +113,18 @@ func PodStatusToConstraintMapper(selfOnly bool, packerMap handler.MapFunc) handl
 		u := &unstructured.Unstructured{}
 		u.SetGroupVersionKind(schema.GroupVersionKind{Group: v1beta1.ConstraintsGroup, Version: "v1beta1", Kind: kind})
 		u.SetName(name)
-		return packerMap(u)
+		return packerMap(ctx, u)
 	}
 }
 
-// add adds a new Controller to mgr with r as the reconcile.Reconciler
+// add adds a new Controller to mgr with r as the reconcile.Reconciler.
 func add(mgr manager.Manager, r reconcile.Reconciler, events <-chan event.GenericEvent) error {
+	if err := indexStatusLabel(context.Background(), mgr, &v1beta1.ConstraintPodStatus{}, v1beta1.ConstraintNameLabel); err != nil {
+		return err
+	}
+	if err := indexStatusLabel(context.Background(), mgr, &v1beta1.ConstraintPodStatus{}, v1beta1.ConstraintKindLabel); err != nil {
+		return err
+	}
 	// Create a new controller
 	c, err := controller.New("constraint-status-controller", mgr, controller.Options{Reconciler: r})
 	if err != nil {
@@ -119,51 +133,48 @@ func add(mgr manager.Manager, r reconcile.Reconciler, events <-chan event.Generi
 
 	// Watch for changes to ConstraintStatus
 	err = c.Watch(
-		&source.Kind{Type: &v1beta1.ConstraintPodStatus{}},
-		handler.EnqueueRequestsFromMapFunc(PodStatusToConstraintMapper(false, util.EventPackerMapFunc())),
-	)
+		source.Kind(mgr.GetCache(), &v1beta1.ConstraintPodStatus{}, handler.TypedEnqueueRequestsFromMapFunc(PodStatusToConstraintMapper(false, util.EventPackerMapFunc()))))
 	if err != nil {
 		return err
 	}
 
+	if events == nil {
+		return nil
+	}
+
 	// Watch for changes to the provided constraint
-	return c.Watch(
-		&source.Channel{
-			Source:         events,
-			DestBufferSize: 1024,
-		},
-		handler.EnqueueRequestsFromMapFunc(util.EventPackerMapFunc()),
-	)
+	return c.Watch(source.Channel(events, handler.EnqueueRequestsFromMapFunc(util.EventPackerMapFunc())))
+}
+
+func indexStatusLabel(ctx context.Context, mgr manager.Manager, obj client.Object, field string) error {
+	return mgr.GetFieldIndexer().IndexField(ctx, obj, field, func(obj client.Object) []string {
+		value := obj.GetLabels()[field]
+		if value == "" {
+			return nil
+		}
+		return []string{value}
+	})
 }
 
 var _ reconcile.Reconciler = &ReconcileConstraintStatus{}
 
-// ReconcileConstraintStatus reconciles an arbitrary constraint object described by Kind
+// ReconcileConstraintStatus reconciles an arbitrary constraint object described by Kind.
 type ReconcileConstraintStatus struct {
 	reader       client.Reader
 	writer       client.Writer
 	statusClient client.StatusClient
 
-	cs     *watch.ControllerSwitch
-	scheme *runtime.Scheme
-	log    logr.Logger
+	scheme     *runtime.Scheme
+	log        logr.Logger
+	ifWatching func(schema.GroupVersionKind, func() error) (bool, error)
 }
 
 // +kubebuilder:rbac:groups=constraints.gatekeeper.sh,resources=*,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=status.gatekeeper.sh,resources=*,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile reads that state of the cluster for a constraint object and makes changes based on the state read
-// and what is in the constraint.Spec
+// and what is in the constraint.Spec.
 func (r *ReconcileConstraintStatus) Reconcile(ctx context.Context, request reconcile.Request) (reconcile.Result, error) {
-	// Short-circuit if shutting down.
-	if r.cs != nil {
-		running := r.cs.Enter()
-		defer r.cs.Exit()
-		if !running {
-			return reconcile.Result{}, nil
-		}
-	}
-
 	gvk, unpackedRequest, err := util.UnpackRequest(request)
 	if err != nil {
 		// Unrecoverable, do not retry.
@@ -180,12 +191,23 @@ func (r *ReconcileConstraintStatus) Reconcile(ctx context.Context, request recon
 
 	instance := &unstructured.Unstructured{}
 	instance.SetGroupVersionKind(gvk)
-	if err := r.reader.Get(ctx, unpackedRequest.NamespacedName, instance); err != nil {
+
+	executed, err := r.ifWatching(gvk, func() error {
+		return r.reader.Get(ctx, unpackedRequest.NamespacedName, instance)
+	})
+	if err != nil {
 		// If the constraint does not exist, we are done
 		if errors.IsNotFound(err) {
 			return reconcile.Result{}, nil
 		}
 		return reconcile.Result{}, err
+	}
+
+	// If the function is not executed, we can assume the constraint
+	// template has been deleted
+	if !executed {
+		// constraint is deleted, nothing to reconcile
+		return reconcile.Result{}, nil
 	}
 
 	r.log.Info("handling constraint status update", "instance", instance)
@@ -194,7 +216,7 @@ func (r *ReconcileConstraintStatus) Reconcile(ctx context.Context, request recon
 	if err := r.reader.List(
 		ctx,
 		sObjs,
-		client.MatchingLabels{
+		client.MatchingFields{
 			v1beta1.ConstraintNameLabel: instance.GetName(),
 			v1beta1.ConstraintKindLabel: instance.GetKind(),
 		},
@@ -214,26 +236,35 @@ func (r *ReconcileConstraintStatus) Reconcile(ctx context.Context, request recon
 		if statusObjs[i].Status.ConstraintUID != instance.GetUID() {
 			continue
 		}
-		j, err := json.Marshal(statusObjs[i].Status)
+		o, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&statusObjs[i].Status)
 		if err != nil {
 			return reconcile.Result{}, err
 		}
-		var o map[string]interface{}
-		if err := json.Unmarshal(j, &o); err != nil {
-			return reconcile.Result{}, err
-		}
 		s = append(s, o)
+	}
+
+	if byPodStatusMatches(instance.Object, s) {
+		return reconcile.Result{}, nil
 	}
 
 	if err := unstructured.SetNestedSlice(instance.Object, s, "status", "byPod"); err != nil {
 		return reconcile.Result{}, err
 	}
 
-	if err = r.statusClient.Status().Update(context.Background(), instance); err != nil {
+	if err = r.statusClient.Status().Update(ctx, instance); err != nil {
 		return reconcile.Result{Requeue: true}, nil
 	}
 
 	return reconcile.Result{}, nil
+}
+
+func byPodStatusMatches(obj map[string]interface{}, desired []interface{}) bool {
+	current, found, err := unstructured.NestedFieldNoCopy(obj, "status", "byPod")
+	if !found || err != nil {
+		return false
+	}
+
+	return apiequality.Semantic.DeepEqual(current, desired)
 }
 
 type sortableStatuses []v1beta1.ConstraintPodStatus

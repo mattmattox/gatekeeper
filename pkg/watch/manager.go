@@ -33,7 +33,7 @@ import (
 
 var log = logf.Log.WithName("watch-manager")
 
-// Manager allows us to dynamically configure what kinds are watched
+// Manager allows us to dynamically configure what kinds are watched.
 type Manager struct {
 	cache      RemovableCache
 	startedMux sync.Mutex
@@ -47,6 +47,9 @@ type Manager struct {
 	watchedKinds vitalsByGVK
 	metrics      *reporter
 
+	// replayTracker allows us to block until replays are complete (or fully canceled)
+	replayTracker *replayTracker
+
 	// Events are passed internally from informer event handlers to handleEvents for distribution.
 	events chan interface{}
 	// replayRequests is used to request or cancel replay for a registrar joining an existing watch.
@@ -59,9 +62,9 @@ type AddFunction func(manager.Manager) error
 // It supports non-blocking calls to get informers, as well as the
 // ability to remove an informer dynamically.
 type RemovableCache interface {
-	GetInformerNonBlocking(obj client.Object) (cache.Informer, error)
+	GetInformer(_ context.Context, obj client.Object, opts ...cache.InformerGetOption) (cache.Informer, error)
 	List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error
-	Remove(obj client.Object) error
+	RemoveInformer(_ context.Context, obj client.Object) error
 }
 
 func New(c RemovableCache) (*Manager, error) {
@@ -81,6 +84,7 @@ func New(c RemovableCache) (*Manager, error) {
 		metrics:        metrics,
 		events:         make(chan interface{}, 1024),
 		replayRequests: make(chan replayRequest),
+		replayTracker:  newReplayTracker(),
 	}
 	wm.managedKinds.mgr = wm
 	return wm, nil
@@ -115,7 +119,7 @@ func (wm *Manager) Start(ctx context.Context) error {
 		return context.Canceled
 	})
 	// Routine for asynchronous replay of past events to joining listeners.
-	grp.Go(wm.replayEventsLoop)
+	grp.Go(wm.replayEventsLoop(ctx))
 	_ = grp.Wait()
 	return nil
 }
@@ -134,13 +138,13 @@ func (wm *Manager) GetManagedGVK() []schema.GroupVersionKind {
 	return wm.managedKinds.GetGVK()
 }
 
-func (wm *Manager) addWatch(r *Registrar, gvk schema.GroupVersionKind) error {
+func (wm *Manager) addWatch(ctx context.Context, r *Registrar, gvk schema.GroupVersionKind) error {
 	wm.watchedMux.Lock()
 	defer wm.watchedMux.Unlock()
-	return wm.doAddWatch(r, gvk)
+	return wm.doAddWatch(ctx, r, gvk)
 }
 
-func (wm *Manager) doAddWatch(r *Registrar, gvk schema.GroupVersionKind) error {
+func (wm *Manager) doAddWatch(ctx context.Context, r *Registrar, gvk schema.GroupVersionKind) error {
 	// lock acquired by caller
 
 	if r == nil {
@@ -173,14 +177,16 @@ func (wm *Manager) doAddWatch(r *Registrar, gvk schema.GroupVersionKind) error {
 	default:
 		u := &unstructured.Unstructured{}
 		u.SetGroupVersionKind(gvk)
-		informer, err := wm.cache.GetInformerNonBlocking(u)
+		informer, err := wm.cache.GetInformer(ctx, u, cache.BlockUntilSynced(false))
 		if err != nil || informer == nil {
 			// This is expected to fail if a CRD is unregistered.
 			return fmt.Errorf("getting informer for kind: %+v %w", gvk, err)
 		}
 
 		// First watcher gets a fresh informer, register for events.
-		informer.AddEventHandler(wm)
+		if _, err := informer.AddEventHandler(wm); err != nil {
+			return err
+		}
 	}
 
 	// Mark it as watched.
@@ -195,13 +201,13 @@ func (wm *Manager) doAddWatch(r *Registrar, gvk schema.GroupVersionKind) error {
 	return nil
 }
 
-func (wm *Manager) removeWatch(r *Registrar, gvk schema.GroupVersionKind) error {
+func (wm *Manager) removeWatch(ctx context.Context, r *Registrar, gvk schema.GroupVersionKind) error {
 	wm.watchedMux.Lock()
 	defer wm.watchedMux.Unlock()
-	return wm.doRemoveWatch(r, gvk)
+	return wm.doRemoveWatch(ctx, r, gvk)
 }
 
-func (wm *Manager) doRemoveWatch(r *Registrar, gvk schema.GroupVersionKind) error {
+func (wm *Manager) doRemoveWatch(ctx context.Context, r *Registrar, gvk schema.GroupVersionKind) error {
 	// lock acquired by caller
 
 	v, ok := wm.watchedKinds[gvk]
@@ -221,24 +227,34 @@ func (wm *Manager) doRemoveWatch(r *Registrar, gvk schema.GroupVersionKind) erro
 		return nil
 	}
 
+	log.Info("all watches removed for gvk, waiting for replays to end", "gvk", gvk)
+
+	// Wait until all replays have exited before canceling the watch,
+	// otherwise the list may unintentionally restart a watch
+	select {
+	case <-wm.replayTracker.replayWaitCh(gvk):
+	case <-wm.stopped:
+	}
+
 	u := &unstructured.Unstructured{}
 	u.SetGroupVersionKind(gvk)
-	if err := wm.cache.Remove(u); err != nil {
+	if err := wm.cache.RemoveInformer(ctx, u); err != nil {
 		return fmt.Errorf("removing %+v: %w", gvk, err)
 	}
 	delete(wm.watchedKinds, gvk)
 	if err := wm.metrics.reportGvkCount(int64(len(wm.watchedKinds))); err != nil {
 		log.Error(err, "while trying to report gvk count metric")
 	}
+	log.Info("watch removed", "gvk", gvk)
 	return nil
 }
 
 // replaceWatches ensures all and only desired watches are running.
-func (wm *Manager) replaceWatches(r *Registrar) error {
+func (wm *Manager) replaceWatches(ctx context.Context, r *Registrar) error {
 	wm.watchedMux.Lock()
 	defer wm.watchedMux.Unlock()
 
-	var errlist errorList
+	errlist := NewErrorList()
 
 	desired := wm.managedKinds.Get()
 	for gvk := range wm.watchedKinds {
@@ -246,8 +262,8 @@ func (wm *Manager) replaceWatches(r *Registrar) error {
 			// This registrar still desires this gvk, skip.
 			continue
 		}
-		if err := wm.doRemoveWatch(r, gvk); err != nil {
-			errlist = append(errlist, fmt.Errorf("removing watch for %+v %w", gvk, err))
+		if err := wm.doRemoveWatch(ctx, r, gvk); err != nil {
+			errlist.RemoveGVKErr(gvk, fmt.Errorf("removing watch for %+v %w", gvk, err))
 		}
 	}
 
@@ -256,8 +272,8 @@ func (wm *Manager) replaceWatches(r *Registrar) error {
 		if !v.registrars[r] {
 			continue
 		}
-		if err := wm.doAddWatch(r, gvk); err != nil {
-			errlist = append(errlist, fmt.Errorf("adding watch for %+v %w", gvk, err))
+		if err := wm.doAddWatch(ctx, r, gvk); err != nil {
+			errlist.AddGVKErr(gvk, fmt.Errorf("adding watch for %+v %w", gvk, err))
 		}
 	}
 
@@ -265,41 +281,76 @@ func (wm *Manager) replaceWatches(r *Registrar) error {
 		log.Error(err, "while trying to report gvk count metric")
 	}
 
-	if errlist != nil {
+	if errlist.Size() > 0 {
 		return errlist
 	}
 	return nil
 }
 
 // OnAdd implements cache.ResourceEventHandler. Called by informers.
-func (wm *Manager) OnAdd(obj interface{}) {
-	// Send event to eventLoop() for processing
-	select {
-	case wm.events <- obj:
-	case <-wm.stopped:
-	}
+func (wm *Manager) OnAdd(obj interface{}, _ bool) {
+	wm.enqueueEvent(obj)
 }
 
 // OnUpdate implements cache.ResourceEventHandler. Called by informers.
 func (wm *Manager) OnUpdate(oldObj, newObj interface{}) {
-	// Send event to eventLoop() for processing
-	select {
-	case wm.events <- oldObj:
-	case <-wm.stopped:
+	if sameObjectIdentity(oldObj, newObj) {
+		wm.enqueueEvent(newObj)
+		return
 	}
-	select {
-	case wm.events <- newObj:
-	case <-wm.stopped:
-	}
+	wm.enqueueEvent(oldObj)
+	wm.enqueueEvent(newObj)
 }
 
 // OnDelete implements cache.ResourceEventHandler. Called by informers.
 func (wm *Manager) OnDelete(obj interface{}) {
+	wm.enqueueEvent(obj)
+}
+
+func (wm *Manager) enqueueEvent(obj interface{}) {
 	// Send event to eventLoop() for processing
 	select {
 	case wm.events <- obj:
 	case <-wm.stopped:
 	}
+}
+
+type objectIdentity struct {
+	gvk       schema.GroupVersionKind
+	namespace string
+	name      string
+	uid       string
+}
+
+func sameObjectIdentity(oldObj, newObj interface{}) bool {
+	oldIdentity, ok := objectIdentityFor(oldObj)
+	if !ok {
+		return false
+	}
+	newIdentity, ok := objectIdentityFor(newObj)
+	if !ok {
+		return false
+	}
+	return oldIdentity == newIdentity
+}
+
+func objectIdentityFor(obj interface{}) (objectIdentity, bool) {
+	clientObj, ok := obj.(client.Object)
+	if !ok || clientObj == nil {
+		return objectIdentity{}, false
+	}
+
+	gvk := clientObj.GetObjectKind().GroupVersionKind()
+	if gvk == (schema.GroupVersionKind{}) || clientObj.GetName() == "" || clientObj.GetUID() == "" {
+		return objectIdentity{}, false
+	}
+
+	return objectIdentity{
+		gvk:       gvk,
+		namespace: clientObj.GetNamespace(),
+		name:      clientObj.GetName(),
+		uid:       string(clientObj.GetUID()),
+	}, true
 }
 
 // eventLoop receives events from informer callbacks and distributes them to registrars.

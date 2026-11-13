@@ -24,33 +24,31 @@ import (
 
 func Test_SingleRunner(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	t.Cleanup(cancel)
 	var wg sync.WaitGroup
 	syncOne := make(chan struct{})
 	syncTwo := make(chan struct{})
+	errChan := make(chan error)
 
-	r := RunnerWithContext(ctx)
+	r := NewSingleRunner(errChan)
 
 	wg.Add(1)
-	r.Go("one", func(ctx context.Context) error {
+	r.Go(ctx, "one", func(ctx context.Context, _ chan<- error) {
 		defer wg.Done()
 		defer close(syncOne)
 		<-ctx.Done()
-		return nil
 	})
 
 	// Repeat key won't be scheduled.
-	r.Go("one", func(ctx context.Context) error {
+	r.Go(ctx, "one", func(_ context.Context, _ chan<- error) {
 		t.Fatal("repeat key will never be scheduled")
-		return nil
 	})
 
 	wg.Add(1)
-	r.Go("two", func(ctx context.Context) error {
+	r.Go(ctx, "two", func(ctx context.Context, _ chan<- error) {
 		defer wg.Done()
 		defer close(syncTwo)
 		<-ctx.Done()
-		return nil
 	})
 
 	select {

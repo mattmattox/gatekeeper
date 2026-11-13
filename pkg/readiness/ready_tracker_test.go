@@ -23,45 +23,67 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/onsi/gomega"
+	externaldataUnversioned "github.com/open-policy-agent/frameworks/constraint/pkg/apis/externaldata/unversioned"
 	"github.com/open-policy-agent/frameworks/constraint/pkg/apis/templates/v1beta1"
-	opa "github.com/open-policy-agent/frameworks/constraint/pkg/client"
-	"github.com/open-policy-agent/frameworks/constraint/pkg/client/drivers/local"
-	podstatus "github.com/open-policy-agent/gatekeeper/apis/status/v1beta1"
-	"github.com/open-policy-agent/gatekeeper/pkg/controller"
-	"github.com/open-policy-agent/gatekeeper/pkg/controller/config/process"
-	"github.com/open-policy-agent/gatekeeper/pkg/mutation"
-	mutationtypes "github.com/open-policy-agent/gatekeeper/pkg/mutation/types"
-	"github.com/open-policy-agent/gatekeeper/pkg/readiness"
-	"github.com/open-policy-agent/gatekeeper/pkg/target"
-	"github.com/open-policy-agent/gatekeeper/pkg/watch"
-	"github.com/open-policy-agent/gatekeeper/third_party/sigs.k8s.io/controller-runtime/pkg/dynamiccache"
+	constraintclient "github.com/open-policy-agent/frameworks/constraint/pkg/client"
+	"github.com/open-policy-agent/frameworks/constraint/pkg/client/drivers/rego"
+	frameworksexternaldata "github.com/open-policy-agent/frameworks/constraint/pkg/externaldata"
+	configv1alpha1 "github.com/open-policy-agent/gatekeeper/v3/apis/config/v1alpha1"
+	syncsetv1alpha1 "github.com/open-policy-agent/gatekeeper/v3/apis/syncset/v1alpha1"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/cachemanager"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/controller"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/controller/config/process"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/expansion"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/fakes"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/mutation"
+	mutationtypes "github.com/open-policy-agent/gatekeeper/v3/pkg/mutation/types"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/readiness"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/syncutil"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/target"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/util"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/watch"
+	"github.com/open-policy-agent/gatekeeper/v3/test/testutils"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
+	"sigs.k8s.io/controller-runtime/pkg/config"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+)
+
+const (
+	ttimeout = 20 * time.Second
+	ttick    = 1 * time.Second
 )
 
 // setupManager sets up a controller-runtime manager with registered watch manager.
 func setupManager(t *testing.T) (manager.Manager, *watch.Manager) {
 	t.Helper()
 
-	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
+	logger := zap.New(zap.UseDevMode(true), zap.WriteTo(testutils.NewTestWriter(t)))
+	ctrl.SetLogger(logger)
 	metrics.Registry = prometheus.NewRegistry()
+	skipNameValidation := true
 	mgr, err := manager.New(cfg, manager.Options{
 		HealthProbeBindAddress: "127.0.0.1:29090",
-		MetricsBindAddress:     "0",
-		NewCache:               dynamiccache.New,
-		MapperProvider: func(c *rest.Config) (meta.RESTMapper, error) {
-			return apiutil.NewDynamicRESTMapper(c)
+		Metrics: metricsserver.Options{
+			BindAddress: "0",
 		},
+		MapperProvider: apiutil.NewDynamicRESTMapper,
+		Logger:         logger,
+		Controller:     config.Controller{SkipNameValidation: &skipNameValidation},
 	})
 	if err != nil {
 		t.Fatalf("setting up controller manager: %s", err)
@@ -81,142 +103,355 @@ func setupManager(t *testing.T) (manager.Manager, *watch.Manager) {
 	return mgr, wm
 }
 
-func setupOpa(t *testing.T) *opa.Client {
-	// initialize OPA
-	driver := local.New(local.Tracing(false))
-	backend, err := opa.NewBackend(opa.Driver(driver))
+func setupDataClient(t *testing.T) *constraintclient.Client {
+	driver, err := rego.New(rego.Tracing(false))
 	if err != nil {
-		t.Fatalf("setting up OPA backend: %v", err)
+		t.Fatalf("setting up Driver: %v", err)
 	}
-	client, err := backend.NewClient(opa.Targets(&target.K8sValidationTarget{}))
+
+	client, err := constraintclient.NewClient(constraintclient.Targets(&target.K8sValidationTarget{}), constraintclient.Driver(driver), constraintclient.EnforcementPoints(util.AuditEnforcementPoint))
 	if err != nil {
-		t.Fatalf("setting up OPA client: %v", err)
+		t.Fatalf("setting up constraint framework client: %v", err)
 	}
 	return client
 }
 
-func setupController(mgr manager.Manager, wm *watch.Manager, opa *opa.Client, mutationSystem *mutation.System) error {
-	tracker, err := readiness.SetupTracker(mgr, mutationSystem != nil)
+func setupController(
+	mgr manager.Manager,
+	wm *watch.Manager,
+	cfClient *constraintclient.Client,
+	mutationSystem *mutation.System,
+	expansionSystem *expansion.System,
+	providerCache *frameworksexternaldata.ProviderCache,
+) error {
+	*expansion.ExpansionEnabled = expansionSystem != nil
+
+	tracker, err := readiness.SetupTracker(mgr, mutationSystem != nil, providerCache != nil, expansionSystem != nil)
 	if err != nil {
 		return fmt.Errorf("setting up tracker: %w", err)
 	}
 
-	// ControllerSwitch will be used to disable controllers during our teardown process,
-	// avoiding conflicts in finalizer cleanup.
-	sw := watch.NewSwitch()
-
-	pod := &corev1.Pod{}
-	pod.Name = "no-pod"
+	pod := fakes.Pod(
+		fakes.WithNamespace("gatekeeper-system"),
+		fakes.WithName("no-pod"),
+	)
 
 	processExcluder := process.Get()
 
+	events := make(chan event.GenericEvent, 1024)
+	syncMetricsCache := syncutil.NewMetricsCache()
+	reg, err := wm.NewRegistrar(
+		cachemanager.RegistrarName,
+		events)
+	if err != nil {
+		return fmt.Errorf("setting up watch manager: %w", err)
+	}
+	cacheManager, err := cachemanager.NewCacheManager(&cachemanager.Config{
+		CfClient:         cfClient,
+		SyncMetricsCache: syncMetricsCache,
+		Tracker:          tracker,
+		ProcessExcluder:  processExcluder,
+		Registrar:        reg,
+		Reader:           mgr.GetCache(),
+	})
+	if err != nil {
+		return fmt.Errorf("setting up cache manager: %w", err)
+	}
+
 	// Setup all Controllers
 	opts := controller.Dependencies{
-		Opa:              opa,
-		WatchManger:      wm,
-		ControllerSwitch: sw,
-		Tracker:          tracker,
-		GetPod:           func() (*corev1.Pod, error) { return pod, nil },
-		ProcessExcluder:  processExcluder,
-		MutationCache:    mutationSystem,
+		CFClient:        cfClient,
+		WatchManger:     wm,
+		Tracker:         tracker,
+		GetPod:          func(_ context.Context) (*corev1.Pod, error) { return pod, nil },
+		ProcessExcluder: processExcluder,
+		MutationSystem:  mutationSystem,
+		ExpansionSystem: expansionSystem,
+		ProviderCache:   providerCache,
+		CacheMgr:        cacheManager,
+		SyncEventsCh:    events,
 	}
-	if err := controller.AddToManager(mgr, opts); err != nil {
+	if err := controller.AddToManager(mgr, &opts); err != nil {
 		return fmt.Errorf("registering controllers: %w", err)
 	}
 	return nil
 }
 
 func Test_AssignMetadata(t *testing.T) {
-	g := gomega.NewWithT(t)
-
-	defer func() {
-		mutationEnabled := false
-		mutation.MutationEnabled = &mutationEnabled
-	}()
-
-	mutationEnabled := true
-	mutation.MutationEnabled = &mutationEnabled
-
-	os.Setenv("POD_NAME", "no-pod")
-	podstatus.DisablePodOwnership()
+	testutils.Setenv(t, "POD_NAME", "no-pod")
 
 	// Apply fixtures *before* the controllers are setup.
 	err := applyFixtures("testdata")
-	g.Expect(err).NotTo(gomega.HaveOccurred(), "applying fixtures")
+	if err != nil {
+		t.Fatalf("applying fixtures: %v", err)
+	}
 
 	// Wire up the rest.
 	mgr, wm := setupManager(t)
-	opaClient := setupOpa(t)
-	mutationCache := mutation.NewSystem()
-	if err := setupController(mgr, wm, opaClient, mutationCache); err != nil {
+	cfClient := setupDataClient(t)
+
+	mutationSystem := mutation.NewSystem(mutation.SystemOpts{})
+	expansionSystem := expansion.NewSystem(mutationSystem)
+	providerCache := frameworksexternaldata.NewCache()
+
+	if err := setupController(mgr, wm, cfClient, mutationSystem, expansionSystem, providerCache); err != nil {
 		t.Fatalf("setupControllers: %v", err)
 	}
 
-	ctx, cancelFunc := context.WithCancel(context.Background())
-	mgrStopped := StartTestManager(ctx, mgr, g)
-	defer func() {
-		cancelFunc()
-		mgrStopped.Wait()
-	}()
+	ctx := context.Background()
+	testutils.StartManager(ctx, t, mgr)
 
+	g := gomega.NewWithT(t)
 	g.Eventually(func() (bool, error) {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 		defer cancel()
 		return probeIsReady(ctx)
-	}, 300*time.Second, 1*time.Second).Should(gomega.BeTrue())
+	}, 30*time.Second, 1*time.Second).Should(gomega.BeTrue())
 
 	// Verify that the AssignMetadata is present in the cache
 	for _, am := range testAssignMetadata {
 		id := mutationtypes.MakeID(am)
-		exptectedMutator := mutationCache.Get(id)
-		g.Expect(exptectedMutator).NotTo(gomega.BeNil(), "expected mutator was not found")
+		expectedMutator := mutationSystem.Get(id)
+
+		if expectedMutator == nil {
+			t.Errorf("got Get(%v) = nil, want non-nil", id)
+		}
+	}
+}
+
+func Test_ModifySet(t *testing.T) {
+	g := gomega.NewWithT(t)
+
+	testutils.Setenv(t, "POD_NAME", "no-pod")
+
+	// Apply fixtures *before* the controllers are set up.
+	err := applyFixtures("testdata")
+	if err != nil {
+		t.Fatalf("applying fixtures: %v", err)
+	}
+
+	// Wire up the rest.
+	mgr, wm := setupManager(t)
+	cfClient := setupDataClient(t)
+
+	mutationSystem := mutation.NewSystem(mutation.SystemOpts{})
+	expansionSystem := expansion.NewSystem(mutationSystem)
+	providerCache := frameworksexternaldata.NewCache()
+
+	if err := setupController(mgr, wm, cfClient, mutationSystem, expansionSystem, providerCache); err != nil {
+		t.Fatalf("setupControllers: %v", err)
+	}
+
+	ctx := context.Background()
+	testutils.StartManager(ctx, t, mgr)
+
+	g.Eventually(func() (bool, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		defer cancel()
+		return probeIsReady(ctx)
+	}, 20*time.Second, 1*time.Second).Should(gomega.BeTrue())
+
+	// Verify that the ModifySet is present in the cache
+	for _, am := range testModifySet {
+		id := mutationtypes.MakeID(am)
+		expectedMutator := mutationSystem.Get(id)
+		if expectedMutator == nil {
+			t.Fatal("want expectedMutator != nil but got nil")
+		}
+	}
+}
+
+func Test_AssignImage(t *testing.T) {
+	g := gomega.NewWithT(t)
+
+	testutils.Setenv(t, "POD_NAME", "no-pod")
+
+	// Apply fixtures *before* the controllers are set up.
+	err := applyFixtures("testdata")
+	if err != nil {
+		t.Fatalf("applying fixtures: %v", err)
+	}
+
+	// Wire up the rest.
+	mgr, wm := setupManager(t)
+	cfClient := setupDataClient(t)
+
+	mutationSystem := mutation.NewSystem(mutation.SystemOpts{})
+	expansionSystem := expansion.NewSystem(mutationSystem)
+	providerCache := frameworksexternaldata.NewCache()
+
+	if err := setupController(mgr, wm, cfClient, mutationSystem, expansionSystem, providerCache); err != nil {
+		t.Fatalf("setupControllers: %v", err)
+	}
+
+	ctx := context.Background()
+	testutils.StartManager(ctx, t, mgr)
+
+	g.Eventually(func() (bool, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		defer cancel()
+		return probeIsReady(ctx)
+	}, 20*time.Second, 1*time.Second).Should(gomega.BeTrue())
+
+	// Verify that the AssignImage is present in the cache
+	for _, am := range testAssignImage {
+		id := mutationtypes.MakeID(am)
+		expectedMutator := mutationSystem.Get(id)
+		if expectedMutator == nil {
+			t.Fatal("want expectedMutator != nil but got nil")
+		}
 	}
 }
 
 func Test_Assign(t *testing.T) {
 	g := gomega.NewWithT(t)
 
-	defer func() {
-		mutationEnabled := false
-		mutation.MutationEnabled = &mutationEnabled
-	}()
-
-	mutationEnabled := true
-	mutation.MutationEnabled = &mutationEnabled
-
-	os.Setenv("POD_NAME", "no-pod")
-	podstatus.DisablePodOwnership()
+	testutils.Setenv(t, "POD_NAME", "no-pod")
 
 	// Apply fixtures *before* the controllers are setup.
 	err := applyFixtures("testdata")
-	g.Expect(err).NotTo(gomega.HaveOccurred(), "applying fixtures")
+	if err != nil {
+		t.Fatalf("applying fixtures: %v", err)
+	}
 
 	// Wire up the rest.
 	mgr, wm := setupManager(t)
-	opaClient := setupOpa(t)
-	mutationCache := mutation.NewSystem()
-	if err := setupController(mgr, wm, opaClient, mutationCache); err != nil {
+	cfClient := setupDataClient(t)
+
+	mutationSystem := mutation.NewSystem(mutation.SystemOpts{})
+	expansionSystem := expansion.NewSystem(mutationSystem)
+	providerCache := frameworksexternaldata.NewCache()
+
+	if err := setupController(mgr, wm, cfClient, mutationSystem, expansionSystem, providerCache); err != nil {
 		t.Fatalf("setupControllers: %v", err)
 	}
 
-	ctx, cancelFunc := context.WithCancel(context.Background())
-	mgrStopped := StartTestManager(ctx, mgr, g)
-	defer func() {
-		cancelFunc()
-		mgrStopped.Wait()
-	}()
+	ctx := context.Background()
+	testutils.StartManager(ctx, t, mgr)
 
 	g.Eventually(func() (bool, error) {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 		defer cancel()
 		return probeIsReady(ctx)
-	}, 300*time.Second, 1*time.Second).Should(gomega.BeTrue())
+	}, 20*time.Second, 1*time.Second).Should(gomega.BeTrue())
 
 	// Verify that the Assign is present in the cache
 	for _, am := range testAssign {
 		id := mutationtypes.MakeID(am)
-		exptectedMutator := mutationCache.Get(id)
-		g.Expect(exptectedMutator).NotTo(gomega.BeNil(), "expected mutator was not found")
+		expectedMutator := mutationSystem.Get(id)
+		if expectedMutator == nil {
+			t.Fatal("want expectedMutator != nil but got nil")
+		}
+	}
+}
+
+func Test_ExpansionTemplate(t *testing.T) {
+	g := gomega.NewWithT(t)
+
+	testutils.Setenv(t, "POD_NAME", "no-pod")
+
+	// Apply fixtures *before* the controllers are setup.
+	err := applyFixtures("testdata")
+	if err != nil {
+		t.Fatalf("applying fixtures: %v", err)
+	}
+
+	// Wire up the rest.
+	mgr, wm := setupManager(t)
+	cfClient := setupDataClient(t)
+
+	mutationSystem := mutation.NewSystem(mutation.SystemOpts{})
+	expansionSystem := expansion.NewSystem(mutationSystem)
+	providerCache := frameworksexternaldata.NewCache()
+
+	if err := setupController(mgr, wm, cfClient, mutationSystem, expansionSystem, providerCache); err != nil {
+		t.Fatalf("setupControllers: %v", err)
+	}
+
+	ctx := context.Background()
+	testutils.StartManager(ctx, t, mgr)
+
+	g.Eventually(func() (bool, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		defer cancel()
+		return probeIsReady(ctx)
+	}, 20*time.Second, 1*time.Second).Should(gomega.BeTrue())
+
+	// Verify that the ExpansionTemplate is registered by expanding a demo deployment
+	// and checking that the resulting Pod is non-nil
+	deployment := makeDeployment("demo-deployment")
+	o, err := runtime.DefaultUnstructuredConverter.ToUnstructured(deployment)
+	if err != nil {
+		panic(fmt.Errorf("error converting deployment to unstructured: %w", err))
+	}
+	u := unstructured.Unstructured{Object: o}
+	m := mutationtypes.Mutable{
+		Object:    &u,
+		Namespace: testNS,
+		Username:  "",
+		Source:    "All",
+	}
+	res, err := expansionSystem.Expand(&m)
+	if err != nil {
+		panic(fmt.Errorf("error expanding: %w", err))
+	}
+	if len(res) != 1 {
+		t.Fatal("expected generator to expand into 1 pod, but got 0 resultants")
+	}
+}
+
+func Test_Provider(t *testing.T) {
+	g := gomega.NewWithT(t)
+
+	providerCache := frameworksexternaldata.NewCache()
+
+	err := os.Setenv("POD_NAME", "no-pod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Apply fixtures *before* the controllers are setup.
+	err = applyFixtures("testdata")
+	if err != nil {
+		t.Fatalf("applying fixtures: %v", err)
+	}
+
+	// Wire up the rest.
+	mgr, wm := setupManager(t)
+	cfClient := setupDataClient(t)
+
+	if err := setupController(mgr,
+		wm,
+		cfClient,
+		mutation.NewSystem(mutation.SystemOpts{}),
+		nil,
+		providerCache); err != nil {
+		t.Fatalf("setupControllers: %v", err)
+	}
+
+	ctx := context.Background()
+	testutils.StartManager(ctx, t, mgr)
+
+	g.Eventually(func() (bool, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		defer cancel()
+		return probeIsReady(ctx)
+	}, 20*time.Second, 1*time.Second).Should(gomega.BeTrue())
+
+	// Verify that the Provider is present in the cache
+	for _, tp := range testProvider {
+		instance, err := providerCache.Get(tp.Name)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		want := externaldataUnversioned.ProviderSpec{
+			URL:      "https://demo",
+			Timeout:  1,
+			CABundle: util.ValidCABundle,
+		}
+		if diff := cmp.Diff(want, instance.Spec); diff != "" {
+			t.Fatal(diff)
+		}
 	}
 }
 
@@ -230,112 +465,146 @@ func Test_Assign(t *testing.T) {
 func Test_Tracker(t *testing.T) {
 	g := gomega.NewWithT(t)
 
-	os.Setenv("POD_NAME", "no-pod")
-	podstatus.DisablePodOwnership()
+	testutils.Setenv(t, "POD_NAME", "no-pod")
 
 	// Apply fixtures *before* the controllers are setup.
 	err := applyFixtures("testdata")
-	g.Expect(err).NotTo(gomega.HaveOccurred(), "applying fixtures")
+	if err != nil {
+		t.Fatalf("applying fixtures: %v", err)
+	}
 
 	// Wire up the rest.
 	mgr, wm := setupManager(t)
-	opaClient := setupOpa(t)
+	cfClient := setupDataClient(t)
+	providerCache := frameworksexternaldata.NewCache()
 
-	if err := setupController(mgr, wm, opaClient, nil); err != nil {
+	if err := setupController(mgr, wm, cfClient, mutation.NewSystem(mutation.SystemOpts{}), nil, providerCache); err != nil {
 		t.Fatalf("setupControllers: %v", err)
 	}
 
-	ctx, cancelFunc := context.WithCancel(context.Background())
-	mgrStopped := StartTestManager(ctx, mgr, g)
-	defer func() {
-		cancelFunc()
-		mgrStopped.Wait()
-	}()
+	ctx := context.Background()
+	testutils.StartManager(ctx, t, mgr)
 
 	// creating the gatekeeper-system namespace is necessary because that's where
 	// status resources live by default
-	g.Expect(createGatekeeperNamespace(mgr.GetConfig())).To(gomega.BeNil())
+	if err := createGatekeeperNamespace(mgr.GetConfig()); err != nil {
+		t.Fatalf("want createGatekeeperNamespace(mgr.GetConfig()) error = nil, got %v", err)
+	}
 
 	g.Eventually(func() (bool, error) {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 		defer cancel()
 		return probeIsReady(ctx)
-	}, 300*time.Second, 1*time.Second).Should(gomega.BeTrue())
+	}, 20*time.Second, 1*time.Second).Should(gomega.BeTrue())
 
 	// Verify cache (tracks testdata fixtures)
 	for _, ct := range testTemplates {
-		_, err := opaClient.GetTemplate(ctx, ct)
-		g.Expect(err).NotTo(gomega.HaveOccurred(), "checking cache for template")
+		_, err := cfClient.GetTemplate(ct)
+		if err != nil {
+			t.Fatalf("checking cache for template: %v", err)
+		}
 	}
 	for _, c := range testConstraints {
-		_, err := opaClient.GetConstraint(ctx, c)
-		g.Expect(err).NotTo(gomega.HaveOccurred(), "checking cache for constraint")
+		_, err := cfClient.GetConstraint(c)
+		if err != nil {
+			t.Fatalf("checking cache for constraint: %v", err)
+		}
 	}
-	// TODO: Verify data if we add the corresponding API to opa.Client.
+	// TODO: Verify data if we add the corresponding API to cf.Client.
 	// for _, d := range testData {
-	// 	_, err := opaClient.GetData(ctx, c)
-	// 	g.Expect(err).NotTo(gomega.HaveOccurred(), "checking cache for constraint")
+	// 	_, err := cfClient.GetData(ctx, c)
+	// 	if err != nil {
+	// t.Fatalf("checking cache for constraint: %v", err)
 	// }
 
 	// Add additional templates/constraints and verify that we remain satisfied
 	err = applyFixtures("testdata/post")
-	g.Expect(err).NotTo(gomega.HaveOccurred(), "applying post fixtures")
+	if err != nil {
+		t.Fatalf("applying post fixtures: %v", err)
+	}
 
 	g.Eventually(func() (bool, error) {
 		// Verify cache (tracks testdata/post fixtures)
-		ctx := context.Background()
 		for _, ct := range postTemplates {
-			_, err := opaClient.GetTemplate(ctx, ct)
+			_, err := cfClient.GetTemplate(ct)
 			if err != nil {
 				return false, err
 			}
 		}
 		for _, c := range postConstraints {
-			_, err := opaClient.GetConstraint(ctx, c)
+			_, err := cfClient.GetConstraint(c)
 			if err != nil {
 				return false, err
 			}
 		}
 
 		return true, nil
-	}, 10*time.Second, 100*time.Millisecond).Should(gomega.BeTrue(), "verifying cache for post-fixtures")
+	}, 20*time.Second, 100*time.Millisecond).Should(gomega.BeTrue(), "verifying cache for post-fixtures")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	g.Expect(probeIsReady(ctx)).Should(gomega.BeTrue(), "became unready after adding additional constraints")
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	t.Cleanup(cancel)
+
+	ready, err := probeIsReady(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ready {
+		t.Fatal("probe should become ready after adding additional constraints")
+	}
 }
 
-// Verifies that a Config resource referencing bogus (unregistered) GVKs will not halt readiness.
-func Test_Tracker_UnregisteredCachedData(t *testing.T) {
-	g := gomega.NewWithT(t)
-
-	// Apply fixtures *before* the controllers are setup.
-	err := applyFixtures("testdata")
-	g.Expect(err).NotTo(gomega.HaveOccurred(), "applying fixtures")
-
-	// Apply config resource with bogus GVK reference
-	err = applyFixtures("testdata/bogus-config")
-	g.Expect(err).NotTo(gomega.HaveOccurred(), "applying config")
-
-	// Wire up the rest.
-	mgr, wm := setupManager(t)
-	opaClient := setupOpa(t)
-	if err := setupController(mgr, wm, opaClient, nil); err != nil {
-		t.Fatalf("setupControllers: %v", err)
+// Verifies additional scenarios to the base "testdata/" fixtures, such as
+// invalid Config resources or overlapping SyncSets, which we want to
+// make sure the ReadyTracker can handle gracefully.
+func Test_Tracker_SyncSourceEdgeCases(t *testing.T) {
+	tts := []struct {
+		name         string
+		fixturesPath string
+	}{
+		{
+			name:         "overlapping syncsets",
+			fixturesPath: "testdata/syncset",
+		},
+		{
+			// bad gvk in Config doesn't halt readiness
+			name:         "bad gvk",
+			fixturesPath: "testdata/config/bad-gvk",
+		},
+		{
+			// repeating gvk in Config doesn't halt readiness
+			name:         "repeating gvk",
+			fixturesPath: "testdata/config/repeating-gvk",
+		},
 	}
 
-	ctx, cancelFunc := context.WithCancel(context.Background())
-	mgrStopped := StartTestManager(ctx, mgr, g)
-	defer func() {
-		cancelFunc()
-		mgrStopped.Wait()
-	}()
+	for _, tt := range tts {
+		t.Run(tt.name, func(t *testing.T) {
+			testutils.Setenv(t, "POD_NAME", "no-pod")
+			require.NoError(t, applyFixtures("testdata"), "base fixtures")
+			require.NoError(t, applyFixtures(tt.fixturesPath), fmt.Sprintf("test fixtures: %s", tt.fixturesPath))
 
-	g.Eventually(func() (bool, error) {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		return probeIsReady(ctx)
-	}, 300*time.Second, 1*time.Second).Should(gomega.BeTrue())
+			mgr, wm := setupManager(t)
+			cfClient := testutils.SetupDataClient(t)
+			providerCache := frameworksexternaldata.NewCache()
+
+			require.NoError(t, setupController(mgr, wm, cfClient, mutation.NewSystem(mutation.SystemOpts{}), nil, providerCache))
+
+			ctx, cancelFunc := context.WithCancel(context.Background())
+			testutils.StartManager(ctx, t, mgr)
+
+			require.Eventually(t, func() bool {
+				ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+				defer cancel()
+
+				ready, err := probeIsReady(ctx)
+				assert.NoError(t, err, "error while waiting for probe to be ready")
+
+				return ready
+			}, ttimeout, ttick, "tracker not healthy")
+
+			cancelFunc()
+		})
+	}
 }
 
 // Test_CollectDeleted adds resources and starts the readiness tracker, then
@@ -347,28 +616,39 @@ func Test_CollectDeleted(t *testing.T) {
 	type test struct {
 		description string
 		gvk         schema.GroupVersionKind
-		tracker     readiness.Expectations
+		tracker     *readiness.Expectations
 	}
 
 	g := gomega.NewWithT(t)
 
 	err := applyFixtures("testdata")
-	g.Expect(err).NotTo(gomega.HaveOccurred(), "applying fixtures")
+	if err != nil {
+		t.Fatalf("applying fixtures: %v", err)
+	}
 
 	mgr, _ := setupManager(t)
-	tracker, err := readiness.SetupTracker(mgr, false)
-	g.Expect(err).NotTo(gomega.HaveOccurred(), "setting up tracker")
 
-	ctx, cancelFunc := context.WithCancel(context.Background())
-	mgrStopped := StartTestManager(ctx, mgr, g)
-	defer func() {
-		cancelFunc()
-		mgrStopped.Wait()
-	}()
+	// Setup tracker with namespaced client to avoid "noise" (control-plane-managed configmaps) from kube-system
+	lister := namespacedLister{
+		lister:    mgr.GetAPIReader(),
+		namespace: "gatekeeper-system",
+	}
+	tracker := readiness.NewTracker(lister, false, false, false)
+	err = mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+		return tracker.Run(ctx)
+	}))
+	if err != nil {
+		t.Fatalf("setting up tracker: %v", err)
+	}
+
+	ctx := context.Background()
+	testutils.StartManager(ctx, t, mgr)
 
 	client := mgr.GetClient()
 
-	g.Expect(tracker.Satisfied(ctx)).To(gomega.BeFalse(), "checking the overall tracker is unsatisfied")
+	if tracker.Satisfied() {
+		t.Fatal("checking the overall tracker is unsatisfied")
+	}
 
 	// set up expected GVKs for tests
 	cgvk := schema.GroupVersionKind{
@@ -379,55 +659,75 @@ func Test_CollectDeleted(t *testing.T) {
 
 	cm := &corev1.ConfigMap{}
 	cmgvk, err := apiutil.GVKForObject(cm, mgr.GetScheme())
-	g.Expect(err).NotTo(gomega.HaveOccurred(), "retrieving ConfigMap GVK")
+	if err != nil {
+		t.Fatalf("retrieving ConfigMap GVK: %v", err)
+	}
 	cmtracker := tracker.ForData(cmgvk)
 
 	ct := &v1beta1.ConstraintTemplate{}
 	ctgvk, err := apiutil.GVKForObject(ct, mgr.GetScheme())
-	g.Expect(err).NotTo(gomega.HaveOccurred(), "retrieving ConstraintTemplate GVK")
+	if err != nil {
+		t.Fatalf("retrieving ConstraintTemplate GVK: %v", err)
+	}
+	config := &configv1alpha1.Config{}
+	configGvk, err := apiutil.GVKForObject(config, mgr.GetScheme())
+	require.NoError(t, err)
+
+	syncset := &syncsetv1alpha1.SyncSet{}
+	syncsetGvk, err := apiutil.GVKForObject(syncset, mgr.GetScheme())
+	require.NoError(t, err)
 
 	// note: state can leak between these test cases because we do not reset the environment
 	// between them to keep the test short. Trackers are mostly independent per GVK.
 	tests := []test{
 		{description: "constraints", gvk: cgvk},
-		{description: "data (configmaps)", gvk: cmgvk, tracker: cmtracker},
+		{description: "data (configmaps)", gvk: cmgvk, tracker: &cmtracker},
 		{description: "templates", gvk: ctgvk},
-		// no need to check Config here since it is not actually Expected for readiness
 		// (the objects identified in a Config's syncOnly are Expected, tested in data case above)
+		{description: "config", gvk: configGvk},
+		{description: "syncset", gvk: syncsetGvk},
 	}
 
 	for _, tc := range tests {
-		var tt readiness.Expectations
-		if tc.tracker != nil {
-			tt = tc.tracker
-		} else {
-			tt = tracker.For(tc.gvk)
-		}
+		t.Run(tc.description, func(t *testing.T) {
+			var tt readiness.Expectations
+			if tc.tracker != nil {
+				tt = *tc.tracker
+			} else {
+				tt = tracker.For(tc.gvk)
+			}
 
-		g.Eventually(func() (bool, error) {
-			return tt.Populated() && !tt.Satisfied(), nil
-		}, 10*time.Second, 1*time.Second).
-			Should(gomega.BeTrue(), "checking the tracker is tracking %s correctly", tc.description)
+			g.Eventually(func() (bool, error) {
+				return tt.Populated() && !tt.Satisfied(), nil
+			}, 20*time.Second, 1*time.Second).
+				Should(gomega.BeTrue(), "checking the tracker is tracking %s correctly")
 
-		ul := &unstructured.UnstructuredList{}
-		ul.SetGroupVersionKind(tc.gvk)
-		err = client.List(ctx, ul)
-		g.Expect(err).NotTo(gomega.HaveOccurred(), "deleting all %s", tc.description)
-		g.Expect(len(ul.Items)).To(gomega.BeNumerically(">=", 1), "expecting nonzero %s", tc.description)
+			ul := &unstructured.UnstructuredList{}
+			ul.SetGroupVersionKind(tc.gvk)
+			err = lister.List(ctx, ul)
+			if err != nil {
+				t.Fatalf("deleting all %s", tc.description)
+			}
+			if len(ul.Items) == 0 {
+				t.Fatal("want items to be nonempty")
+			}
 
-		for index := range ul.Items {
-			err = client.Delete(ctx, &ul.Items[index])
-			g.Expect(err).NotTo(gomega.HaveOccurred(), "deleting %s %s", tc.description, ul.Items[index].GetName())
-		}
+			for index := range ul.Items {
+				err = client.Delete(ctx, &ul.Items[index])
+				if err != nil {
+					t.Fatalf("deleting %s %s", tc.description, ul.Items[index].GetName())
+				}
+			}
 
-		g.Eventually(func() (bool, error) {
-			return tt.Satisfied(), nil
-		}, 10*time.Second, 1*time.Second).
-			Should(gomega.BeTrue(), "checking the tracker collects deletes of %s", tc.description)
+			g.Eventually(func() (bool, error) {
+				return tt.Satisfied(), nil
+			}, 20*time.Second, 1*time.Second).
+				Should(gomega.BeTrue(), "checking the tracker collects deletes of %s")
+		})
 	}
 }
 
-// probeIsReady checks whether expectations have been satisfied (via the readiness probe)
+// probeIsReady checks whether expectations have been satisfied (via the readiness probe).
 func probeIsReady(ctx context.Context) (bool, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://127.0.0.1:29090/readyz", http.NoBody)
 	if err != nil {
@@ -443,4 +743,17 @@ func probeIsReady(ctx context.Context) (bool, error) {
 	}
 
 	return resp.StatusCode >= 200 && resp.StatusCode < 400, nil
+}
+
+// namespacedLister scopes a lister to a particular namespace.
+type namespacedLister struct {
+	namespace string
+	lister    readiness.Lister
+}
+
+func (n namespacedLister) List(ctx context.Context, list ctrlclient.ObjectList, opts ...ctrlclient.ListOption) error {
+	if n.namespace != "" {
+		opts = append(opts, ctrlclient.InNamespace(n.namespace))
+	}
+	return n.lister.List(ctx, list, opts...)
 }

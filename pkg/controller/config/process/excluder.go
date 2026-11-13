@@ -2,12 +2,12 @@ package process
 
 import (
 	"reflect"
+	"sort"
 	"sync"
 
-	configv1alpha1 "github.com/open-policy-agent/gatekeeper/apis/config/v1alpha1"
-	"github.com/pkg/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
-	"k8s.io/apimachinery/pkg/runtime"
+	configv1alpha1 "github.com/open-policy-agent/gatekeeper/v3/apis/config/v1alpha1"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/wildcard"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // Process indicates the Gatekeeper component from which the resource will be excluded.
@@ -24,17 +24,18 @@ const (
 
 type Excluder struct {
 	mux                sync.RWMutex
-	excludedNamespaces map[Process]map[string]bool
+	excludedNamespaces map[Process]map[wildcard.Wildcard]bool
 }
 
 var allProcesses = []Process{
 	Audit,
 	Webhook,
+	Mutation,
 	Sync,
 }
 
 var processExcluder = &Excluder{
-	excludedNamespaces: make(map[Process]map[string]bool),
+	excludedNamespaces: make(map[Process]map[wildcard.Wildcard]bool),
 }
 
 func Get() *Excluder {
@@ -43,7 +44,7 @@ func Get() *Excluder {
 
 func New() *Excluder {
 	return &Excluder{
-		excludedNamespaces: make(map[Process]map[string]bool),
+		excludedNamespaces: make(map[Process]map[wildcard.Wildcard]bool),
 	}
 }
 
@@ -58,13 +59,13 @@ func (s *Excluder) Add(entry []configv1alpha1.MatchEntry) {
 				if Process(op) == Star {
 					for _, o := range allProcesses {
 						if s.excludedNamespaces[o] == nil {
-							s.excludedNamespaces[o] = make(map[string]bool)
+							s.excludedNamespaces[o] = make(map[wildcard.Wildcard]bool)
 						}
 						s.excludedNamespaces[o][ns] = true
 					}
 				} else {
 					if s.excludedNamespaces[Process(op)] == nil {
-						s.excludedNamespaces[Process(op)] = make(map[string]bool)
+						s.excludedNamespaces[Process(op)] = make(map[wildcard.Wildcard]bool)
 					}
 					s.excludedNamespaces[Process(op)][ns] = true
 				}
@@ -73,30 +74,65 @@ func (s *Excluder) Add(entry []configv1alpha1.MatchEntry) {
 	}
 }
 
-func (s *Excluder) Replace(new *Excluder) {
+func (s *Excluder) Replace(new *Excluder) { // nolint:revive
 	s.mux.Lock()
 	defer s.mux.Unlock()
 	s.excludedNamespaces = new.excludedNamespaces
 }
 
-func (s *Excluder) Equals(new *Excluder) bool {
+func (s *Excluder) Equals(new *Excluder) bool { // nolint:revive
 	s.mux.RLock()
 	defer s.mux.RUnlock()
 	return reflect.DeepEqual(s.excludedNamespaces, new.excludedNamespaces)
 }
 
-func (s *Excluder) IsNamespaceExcluded(process Process, obj runtime.Object) (bool, error) {
+// EqualsForProcess checks if the excluded namespaces for a specific process are equal.
+func (s *Excluder) EqualsForProcess(process Process, new *Excluder) bool { // nolint:revive
+	s.mux.RLock()
+	defer s.mux.RUnlock()
+	return reflect.DeepEqual(s.excludedNamespaces[process], new.excludedNamespaces[process])
+}
+
+// HasExclusions returns true if namespace exclusions are configured for the given process.
+func (s *Excluder) HasExclusions(process Process) bool {
 	s.mux.RLock()
 	defer s.mux.RUnlock()
 
-	meta, err := meta.Accessor(obj)
-	if err != nil {
-		return false, errors.Wrapf(err, "Failed to get accessor for %s - %s", obj.GetObjectKind().GroupVersionKind().Group, obj.GetObjectKind().GroupVersionKind().Kind)
-	}
+	return len(s.excludedNamespaces[process]) > 0
+}
+
+func (s *Excluder) IsNamespaceExcluded(process Process, obj client.Object) (bool, error) {
+	s.mux.RLock()
+	defer s.mux.RUnlock()
 
 	if obj.GetObjectKind().GroupVersionKind().Kind == "Namespace" && obj.GetObjectKind().GroupVersionKind().Group == "" {
-		return s.excludedNamespaces[process][meta.GetName()], nil
+		return exactOrWildcardMatch(s.excludedNamespaces[process], obj.GetName()), nil
 	}
 
-	return s.excludedNamespaces[process][meta.GetNamespace()], nil
+	return exactOrWildcardMatch(s.excludedNamespaces[process], obj.GetNamespace()), nil
+}
+
+// GetExcludedNamespaces returns a list of excluded namespace patterns for the given process.
+func (s *Excluder) GetExcludedNamespaces(process Process) []string {
+	s.mux.RLock()
+	defer s.mux.RUnlock()
+
+	var excludedNamespaces []string
+	for ns := range s.excludedNamespaces[process] {
+		excludedNamespaces = append(excludedNamespaces, string(ns))
+	}
+	// Sort for deterministic ordering; map iteration order is not stable.
+	sort.Strings(excludedNamespaces)
+
+	return excludedNamespaces
+}
+
+func exactOrWildcardMatch(boolMap map[wildcard.Wildcard]bool, ns string) bool {
+	for k := range boolMap {
+		if k.Matches(ns) {
+			return true
+		}
+	}
+
+	return false
 }

@@ -4,22 +4,42 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/open-policy-agent/gatekeeper/pkg/logging"
-	"github.com/open-policy-agent/gatekeeper/pkg/mutation/path/parser"
-	path "github.com/open-policy-agent/gatekeeper/pkg/mutation/path/tester"
-	"github.com/open-policy-agent/gatekeeper/pkg/mutation/types"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/mutation/path/parser"
+	path "github.com/open-policy-agent/gatekeeper/v3/pkg/mutation/path/tester"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/mutation/types"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-var (
-	log = logf.Log.WithName("mutation").WithValues(logging.Process, "mutation")
-)
+var _ types.MetadataGetter = &metadata{}
 
-func Mutate(mutator types.Mutator, tester *path.Tester, valueTest func(interface{}, bool) bool, obj *unstructured.Unstructured) (bool, error) {
-	s := &mutatorState{mutator: mutator, tester: tester, valueTest: valueTest}
-	if len(mutator.Path().Nodes) == 0 {
-		return false, fmt.Errorf("mutator %v has an empty target location", mutator.ID())
+type metadata client.ObjectKey
+
+func (m *metadata) GetName() string {
+	return m.Name
+}
+
+func (m *metadata) GetNamespace() string {
+	return m.Namespace
+}
+
+func Mutate(
+	path parser.Path,
+	tester *path.Tester,
+	setter Setter,
+	obj *unstructured.Unstructured,
+) (bool, error) {
+	if setter == nil {
+		return false, errors.New("setter must not be nil")
+	}
+	s := &mutatorState{
+		path:     path,
+		tester:   tester,
+		setter:   setter,
+		metadata: &metadata{Name: obj.GetName(), Namespace: obj.GetNamespace()},
+	}
+	if len(path.Nodes) == 0 {
+		return false, errors.New("attempting to mutate an empty target location")
 	}
 	if obj == nil {
 		return false, errors.New("attempting to mutate a nil object")
@@ -29,17 +49,16 @@ func Mutate(mutator types.Mutator, tester *path.Tester, valueTest func(interface
 }
 
 type mutatorState struct {
-	mutator types.Mutator
-	tester  *path.Tester
-	// valueTest takes the input value and whether that value already existed.
-	// It returns true if the value should be mutated
-	valueTest func(interface{}, bool) bool
+	path     parser.Path
+	tester   *path.Tester
+	setter   Setter
+	metadata *metadata
 }
 
 // mutateInternal mutates the resource recursively. It returns false if there has been no change
-// to any downstream objects in the tree, indicating that the mutation should not be persisted
+// to any downstream objects in the tree, indicating that the mutation should not be persisted.
 func (s *mutatorState) mutateInternal(current interface{}, depth int) (bool, interface{}, error) {
-	pathEntry := s.mutator.Path().Nodes[depth]
+	pathEntry := s.path.Nodes[depth]
 	switch castPathEntry := pathEntry.(type) {
 	case *parser.Object:
 		currentAsObject, ok := current.(map[string]interface{})
@@ -57,15 +76,10 @@ func (s *mutatorState) mutateInternal(current interface{}, depth int) (bool, int
 			}
 		}
 		// we have hit the end of our path, this is the base case
-		if len(s.mutator.Path().Nodes)-1 == depth {
-			if s.valueTest != nil && !s.valueTest(next, exists) {
-				return false, nil, nil
-			}
-			value, err := s.mutator.Value()
-			if err != nil {
+		if len(s.path.Nodes)-1 == depth {
+			if err := s.setter.SetValue(currentAsObject, castPathEntry.Reference); err != nil {
 				return false, nil, err
 			}
-			currentAsObject[castPathEntry.Reference] = value
 			return true, currentAsObject, nil
 		}
 		if !exists { // Next element is missing and needs to be added
@@ -91,7 +105,11 @@ func (s *mutatorState) mutateInternal(current interface{}, depth int) (bool, int
 		}
 		shallowCopy := make([]interface{}, len(currentAsList))
 		copy(shallowCopy, currentAsList)
-		if len(s.mutator.Path().Nodes)-1 == depth {
+		// base case
+		if len(s.path.Nodes)-1 == depth {
+			if !s.setter.KeyedListOkay() {
+				return false, nil, ErrNonKeyedSetter
+			}
 			return s.setListElementToValue(shallowCopy, castPathEntry, depth)
 		}
 
@@ -112,7 +130,7 @@ func (s *mutatorState) mutateInternal(current interface{}, depth int) (bool, int
 				elementFound = true
 			} else if listElementAsObject, ok := listElement.(map[string]interface{}); ok {
 				if elementValue, ok := listElementAsObject[key]; ok {
-					if *castPathEntry.KeyValue == elementValue {
+					if castPathEntry.KeyValue == elementValue {
 						if !s.tester.ExistsOkay(depth) {
 							return false, nil, nil
 						}
@@ -152,24 +170,20 @@ func (s *mutatorState) setListElementToValue(currentAsList []interface{}, listPa
 	if listPathEntry.Glob {
 		return false, nil, fmt.Errorf("last path entry can not be globbed")
 	}
-	newValue, err := s.mutator.Value()
+
+	newValueAsObject, err := s.setter.KeyedListValue()
 	if err != nil {
-		log.Error(err, "error getting mutator value for mutator %+v", s.mutator)
 		return false, nil, err
-	}
-	newValueAsObject, ok := newValue.(map[string]interface{})
-	if !ok {
-		return false, nil, fmt.Errorf("last path entry of type list requires an object value, pathEntry: %+v", listPathEntry)
 	}
 
 	key := listPathEntry.KeyField
 	if listPathEntry.KeyValue == nil {
 		return false, nil, errors.New("encountered nil key value when setting a new list element")
 	}
-	keyValue := *listPathEntry.KeyValue
+	keyValue := listPathEntry.KeyValue
 
 	for i, listElement := range currentAsList {
-		if elementValue, found, err := nestedString(listElement, key); err != nil {
+		if elementValue, found, err := nestedFieldNoCopy(listElement, key); err != nil {
 			return false, nil, err
 		} else if found && keyValue == elementValue {
 			newKeyValue, ok := newValueAsObject[key]
@@ -191,8 +205,8 @@ func (s *mutatorState) setListElementToValue(currentAsList []interface{}, listPa
 
 func (s *mutatorState) createMissingElement(depth int) (interface{}, error) {
 	var next interface{}
-	pathEntry := s.mutator.Path().Nodes[depth]
-	nextPathEntry := s.mutator.Path().Nodes[depth+1]
+	pathEntry := s.path.Nodes[depth]
+	nextPathEntry := s.path.Nodes[depth+1]
 
 	// Create new element of type
 	switch nextPathEntry.(type) {
@@ -211,15 +225,15 @@ func (s *mutatorState) createMissingElement(depth int) (interface{}, error) {
 		if castPathEntry.KeyValue == nil {
 			return nil, fmt.Errorf("list entry has no key value")
 		}
-		nextAsObject[castPathEntry.KeyField] = *castPathEntry.KeyValue
+		nextAsObject[castPathEntry.KeyField] = castPathEntry.KeyValue
 	}
 	return next, nil
 }
 
-func nestedString(current interface{}, key string) (string, bool, error) {
+func nestedFieldNoCopy(current interface{}, key string) (interface{}, bool, error) {
 	currentAsMap, ok := current.(map[string]interface{})
 	if !ok {
 		return "", false, fmt.Errorf("cast error, unable to case %T to map[string]interface{}", current)
 	}
-	return unstructured.NestedString(currentAsMap, key)
+	return unstructured.NestedFieldNoCopy(currentAsMap, key)
 }

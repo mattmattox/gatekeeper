@@ -18,38 +18,38 @@ package syncutil
 import (
 	"context"
 	"sync"
-
-	"golang.org/x/sync/errgroup"
 )
 
 // SingleRunner wraps an errgroup to run keyed goroutines as singletons.
 // Keys are single-use and subsequent usage to schedule will be silently ignored.
 // Goroutines can be individually canceled provided they respect the context passed to them.
 type SingleRunner struct {
-	m   map[string]context.CancelFunc
-	mu  sync.Mutex
-	grp *errgroup.Group
-	ctx context.Context
+	m  map[string]context.CancelFunc
+	mu sync.RWMutex
+	wg *sync.WaitGroup
+	ec chan<- error
 }
 
-// RunnerWithContext returns an initialized SingleRunner.
-// The provided context is used as the parent of subsequently scheduled goroutines.
-func RunnerWithContext(ctx context.Context) *SingleRunner {
-	grp, ctx := errgroup.WithContext(ctx)
+// NewSingleRunner returns an initialized SingleRunner.
+func NewSingleRunner(errChan chan<- error) *SingleRunner {
 	return &SingleRunner{
-		grp: grp,
-		ctx: ctx,
-		m:   make(map[string]context.CancelFunc),
+		wg: &sync.WaitGroup{},
+		m:  make(map[string]context.CancelFunc),
+		ec: errChan,
 	}
 }
 
 // Wait waits for all goroutines managed by the SingleRunner to complete.
 // Returns the first error returned from a managed goroutine, or nil.
-func (s *SingleRunner) Wait() error {
-	if s.grp == nil {
-		return nil
+func (s *SingleRunner) Wait() {
+	s.mu.RLock()
+	grp := s.wg
+	s.mu.RUnlock()
+	if grp == nil {
+		return
 	}
-	err := s.grp.Wait()
+
+	grp.Wait()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -59,12 +59,11 @@ func (s *SingleRunner) Wait() error {
 		}
 		c()
 	}
-	return err
 }
 
 // Go schedules the provided function on a new goroutine if the provided key has
 // not been used for scheduling before.
-func (s *SingleRunner) Go(key string, f func(context.Context) error) {
+func (s *SingleRunner) Go(ctx context.Context, key string, f func(context.Context, chan<- error)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -77,19 +76,13 @@ func (s *SingleRunner) Go(key string, f func(context.Context) error) {
 		return
 	}
 
-	var ctx context.Context
-	switch {
-	case s.ctx != nil:
-		ctx = s.ctx
-	default:
-		ctx = context.Background()
-	}
-
 	ctx, cancel := context.WithCancel(ctx)
 	s.m[key] = cancel
-	s.grp.Go(func() error {
-		return f(ctx)
-	})
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		f(ctx, s.ec)
+	}()
 }
 
 // Cancel cancels a keyed goroutine if it exists.

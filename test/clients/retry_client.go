@@ -24,7 +24,7 @@ import (
 )
 
 var (
-	// defaultRefilRate is the default rate at which potential calls are
+	// defaultRefillRate is the default rate at which potential calls are
 	// added back to the "bucket" of allowed calls.
 	defaultRefillRate = 5
 	// defaultLimitSize is the default starting/max number of potential calls
@@ -68,7 +68,7 @@ func retry(ctx context.Context, limiter *rate.Limiter, f func() error) error {
 	}
 }
 
-func (c *RetryClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object) error {
+func (c *RetryClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, _ ...client.GetOption) error {
 	return retry(ctx, c.Limiter, func() error {
 		return c.Client.Get(ctx, key, obj)
 	})
@@ -119,13 +119,13 @@ type RetryStatusWriter struct {
 	Limiter *rate.Limiter
 }
 
-func (c *RetryStatusWriter) Update(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
+func (c *RetryStatusWriter) Update(ctx context.Context, obj client.Object, opts ...client.SubResourceUpdateOption) error {
 	return retry(ctx, c.Limiter, func() error {
 		return c.StatusWriter.Update(ctx, obj, opts...)
 	})
 }
 
-func (c *RetryStatusWriter) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+func (c *RetryStatusWriter) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
 	return retry(ctx, c.Limiter, func() error {
 		return c.StatusWriter.Patch(ctx, obj, patch, opts...)
 	})

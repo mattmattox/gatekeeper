@@ -1,7 +1,8 @@
+---
+{{- if .Values.rbac.create }}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  creationTimestamp: null
   labels:
     app: '{{ template "gatekeeper.name" . }}'
     chart: '{{ template "gatekeeper.name" . }}'
@@ -11,9 +12,52 @@ metadata:
   name: gatekeeper-manager-role
 rules:
 - apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
   - '*'
   resources:
   - '*'
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - admissionregistration.k8s.io
+  resourceNames:
+  - {{ .Values.mutatingWebhookName }}
+  {{- range $additionalMutatingWebhookConfig := .Values.additionalMutatingWebhookConfigsToRotateCerts }}
+  - {{ $additionalMutatingWebhookConfig }}
+  {{- end }}
+  resources:
+  - mutatingwebhookconfigurations
+  verbs:
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - admissionregistration.k8s.io
+  resources:
+  - validatingadmissionpolicies
+  - validatingadmissionpolicybindings
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - admissionregistration.k8s.io
+  resources:
+  - validatingwebhookconfigurations
   verbs:
   - get
   - list
@@ -33,6 +77,7 @@ rules:
 - apiGroups:
   - config.gatekeeper.sh
   resources:
+  - '*'
   - configs
   verbs:
   - create
@@ -51,44 +96,38 @@ rules:
   - patch
   - update
 - apiGroups:
+  - connection.gatekeeper.sh
   - constraints.gatekeeper.sh
-  resources:
-  - '*'
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
+  - expansion.gatekeeper.sh
   - mutations.gatekeeper.sh
-  resources:
-  - '*'
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - policy
-  resourceNames:
-  - gatekeeper-admin
-  resources:
-  - podsecuritypolicies
-  verbs:
-  - use
-- apiGroups:
   - status.gatekeeper.sh
   resources:
   - '*'
   verbs:
   - create
   - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - externaldata.gatekeeper.sh
+  resources:
+  - providers
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - externaldata.gatekeeper.sh
+  resources:
+  - providers/status
+  verbs:
   - get
   - list
   - patch
@@ -111,9 +150,6 @@ rules:
   resources:
   - constrainttemplates/finalizers
   verbs:
-  - delete
-  - get
-  - patch
   - update
 - apiGroups:
   - templates.gatekeeper.sh
@@ -126,7 +162,10 @@ rules:
 - apiGroups:
   - admissionregistration.k8s.io
   resourceNames:
-  - gatekeeper-validating-webhook-configuration
+  - {{ .Values.validatingWebhookName }}
+  {{- range $additionalValidatingWebhookConfig := .Values.additionalValidatingWebhookConfigsToRotateCerts }}
+  - {{ $additionalValidatingWebhookConfig }}
+  {{- end }}
   resources:
   - validatingwebhookconfigurations
   verbs:
@@ -137,17 +176,4 @@ rules:
   - patch
   - update
   - watch
-- apiGroups:
-  - admissionregistration.k8s.io
-  resourceNames:
-  - gatekeeper-mutating-webhook-configuration
-  resources:
-  - mutatingwebhookconfigurations
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
+{{- end }}

@@ -1,0 +1,336 @@
+---
+id: validating-admission-policy
+title: Integration with Kubernetes Validating Admission Policy
+---
+
+Validating Admission Policy CEL validation in Gatekeeper:
+Feature State: Gatekeeper version v3.18 (stable)
+
+:::note
+Set `--enable-k8s-native-validation=false` to disable evaluating Validating Admission Policy CEL in constraint templates.
+
+The `--sync-vap-enforcement-scope` flag (enabled by default) ensures Gatekeeper generates ValidatingAdmissionPolicy (VAP) resources while honoring the match criteria and namespace selectors in [ValidatingWebhookConfig](https://github.com/open-policy-agent/gatekeeper/blob/master/charts/gatekeeper/templates/gatekeeper-validating-webhook-configuration-validatingwebhookconfiguration.yaml#L35) and the namespace exclusions in the [Gatekeeper `Config` resource](https://open-policy-agent.github.io/gatekeeper/website/docs/exempt-namespaces/#exempting-namespaces-from-gatekeeper-using-config-resource). Set `--sync-vap-enforcement-scope=false` to disable this behavior.
+:::
+
+:::warning
+The `--sync-vap-enforcement-scope` flag is deprecated and will be removed in Gatekeeper v3.24.
+:::
+
+VAP management through Gatekeeper:
+Feature State: Gatekeeper version v3.20 (beta)
+❗ This feature is beta, subject to change (feedback is welcome!). It is enabled by default.
+
+## Description
+
+This feature allows Gatekeeper to integrate with Kubernetes Validating Admission Policy based on [Common Expression Language (CEL)](https://github.com/google/cel-spec), a declarative, in-process admission control alternative to validating admission webhooks.
+
+## Namespace exemptions and upgrades
+
+With scope synchronization enabled, generated VAPs inherit the validating webhook's complete `namespaceSelector`, including custom selectors. The default selector excludes namespaces carrying the `admission.gatekeeper.sh/ignore` label. The `--exempt-namespace`, `--exempt-namespace-prefix`, and `--exempt-namespace-suffix` flags only authorize which namespaces may carry that label; matching a flag does not itself exempt a namespace. See [Exempting Namespaces](exempt-namespaces.md) for the labeling procedure.
+
+:::warning
+Earlier versions also generated a name-based VAP exemption condition. After upgrading, resources in namespaces that match an exemption flag but do not carry the ignore label are no longer exempt for that reason. Requests that violate an applicable policy can now be denied. Review affected namespaces before upgrading, and add the ignore label only where exemption is intended and permitted. Existing resources are not automatically deleted. Config-based namespace exclusions remain independent of label-based exemptions.
+:::
+
+When a non-empty validating webhook configuration name is configured but its configuration is not available in Gatekeeper's cache, VAP generation reports an error and retries instead of generating a policy with a different scope. Existing VAPs retain their last successfully synchronized configuration; new VAPs wait for the configuration to become available. After an upgrade, verify VAP generation status and the selectors on generated policies before relying on their enforcement.
+
+### Generation without a validating webhook
+
+Setting Helm's `disableValidatingWebhook=true` does not disable VAP generation. The chart passes an empty `--validating-webhook-configuration-name=` to both deployments to explicitly indicate that no validating webhook configuration should be inherited. For non-Helm installations, set this flag on every VAP generator when no validating webhook configuration is intended. The flag does not delete any existing webhook configuration.
+
+In this mode, generated VAPs use default resource rules for `CREATE` and `UPDATE`, retain constraint matching, and continue to honor the `Config` resource's `webhook` namespace exclusions while `--sync-vap-enforcement-scope=true`. They do not inherit webhook selectors or match conditions. Disabling scope synchronization instead would also disable Config-based scope synchronization.
+
+The ignore label and namespace exemption flags do not independently exempt resources in this mode. Disabling the validating webhook also removes the label-authorization webhook, so automatically trusting the ignore label would allow namespace editors to bypass native enforcement. Use administrator-controlled Config exclusions or constraint matching for intentional exclusions. Review generated policies after changing modes: existing VAPs are updated through reconciliation, not atomically with the Helm change.
+
+## Motivations
+
+The Kubernetes Validating Admission Policy feature was introduced as an alpha feature to Kubernetes v1.26, beta in v1.28 (disabled by default), GA in v1.30 (enabled by default). Some of the benefits include:
+- in-tree/native in-process
+- reduce admission request latency
+- improve reliability and availability
+- able to fail closed without impacting availability
+- avoid the operational burden of webhooks
+
+To reduce policy fragmentation and simplify the user experience by standardizing the policy experience. We have created an abstraction layer that provides multi-language (e.g. Rego and CEL), multi-target policy enforcement to allow for portable policies and coexistence of numerous policy implementations.
+
+The [Constraint Framework](https://github.com/open-policy-agent/frameworks/tree/master/constraint) is the library that underlies Gatekeeper. It provides the execution flow Gatekeeper uses to render a decision to the API server. It also provides abstractions that allow us to define constraint templates and constraints: Engine, Enforcement Points, and Targets.
+
+Together with Gatekeeper and [gator CLI](gator.md), you can get admission, audit, and shift left validations for policies written in both CEL and Rego policy languages, even for clusters that do not support Validating Admission Policy feature yet. For simple policies, you may want admission requests to be handled by the K8s built-in Validating Admission Controller (only supports CEL) instead of the Gatekeeper admission webhook.
+
+In summary, these are potential options when running Gatekeeper:
+
+| Policy Language(s)    | Enforcement Point  |
+| ------------------ | ------------------ |
+| CEL, Rego          | Gatekeeper validating webhook |
+| CEL, Rego          | Gatekeeper Audit   |
+| CEL, Rego          | Gator CLI          |
+| CEL                | K8s built-in Validating Admission Controller (aka ValidatingAdmissionPolicy) |
+| Rego               | Gatekeeper validating webhook (referential policies, external data) |
+| Rego               | Gatekeeper Audit (referential policies, external data) |
+| Rego               | Gator CLI (referential policies) |
+
+Find out more about different [enforcement points](enforcement-points.md)
+
+## Pre-requisites
+
+- Requires minimum Gatekeeper v3.17.0 (Please refer to the v3.16.0 docs as flags have changed)
+- Requires minimum Kubernetes v1.30, when the Kubernetes `Validating Admission Policy` feature GAed
+- [optional] Kubernetes version v1.29, need to enable Kubernetes feature gate and runtime config as shown below: 
+
+    ```yaml
+    kind: Cluster
+    apiVersion: kind.x-k8s.io/v1alpha4
+    featureGates:
+      ValidatingAdmissionPolicy: true
+    runtimeConfig:
+      admissionregistration.k8s.io/v1beta1: true
+    ```
+
+## Get started
+
+## Policy updates to add VAP CEL
+To see how it works, check out this [demo](https://github.com/open-policy-agent/gatekeeper/tree/master/demo/k8s-validating-admission-policy)
+
+Example `K8sRequiredLabels` constraint template using the `K8sNativeValidation` engine and VAP CEL expressions that requires resources to contain specified labels with values matching provided regular expressions. A similar policy written in Rego can be seen [here](https://open-policy-agent.github.io/gatekeeper-library/website/validation/requiredlabels)
+
+```yaml
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: k8srequiredlabels
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sRequiredLabels
+      validation:
+        # Schema for the `parameters` field
+        openAPIV3Schema:
+          type: object
+          properties:
+            message:
+              type: string
+            labels:
+              type: array
+              items:
+                type: object
+                properties:
+                  key:
+                    type: string
+                  allowedRegex:
+                    type: string
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      code:
+        - engine: K8sNativeValidation
+          source:
+            validations:
+            - expression: '[object, oldObject].exists(obj, obj != null && has(obj.metadata) && variables.params.labels.all(entry, has(obj.metadata.labels) && entry.key in obj.metadata.labels))'
+              messageExpression: '"missing required label, requires all of: " + variables.params.labels.map(entry, entry.key).join(", ")'
+            - expression: '[object, oldObject].exists(obj, obj != null && !variables.params.labels.exists(entry, has(obj.metadata.labels) && entry.key in obj.metadata.labels && !string(obj.metadata.labels[entry.key]).matches(string(entry.allowedRegex))))'
+              message: "regex mismatch"
+        rego: |
+          ...
+```
+
+With this new engine and source added to the constraint template, now Gatekeeper webhook, audit, and shift-left can validate resources with these new VAP CEL-based rules. For more details on VAP-style CEL syntax, refer to the Kubernetes [Validating Admission Policy documentation](https://kubernetes.io/docs/reference/access-authn-authz/validating-admission-policy/).
+
+## Policy updates to generate Validating Admission Policy and Binding resources
+
+For some policies, you may want admission requests to be handled by the K8s Validating Admission Controller instead of the Gatekeeper admission webhook.
+
+The K8s Validating Admission Controller requires both the Validating Admission Policy (VAP) and Validating Admission Policy Binding (VAPB) resources to exist to enforce a policy. Gatekeeper can be configured to generate both of these resources. To generate VAP Bindings for all Constraints, ensure the Gatekeeper 
+`--default-create-vap-binding-for-constraints` flag is set to `true`. To enable VAP generation for all Constraint Templates with the VAP CEL engine `K8sNativeValidation`, ensure the Gatekeeper `--default-create-vap-for-templates=true` flag is set to `true`. In `template` mode this creates a VAP owned by the ConstraintTemplate. In `constraint` mode it makes the template eligible for per-Constraint VAP generation but does not create a template-owned VAP. By default both flags are set to `true` now that the feature is in beta.
+
+If a K8sNativeValidation source omits `failurePolicy`, Gatekeeper uses `--default-k8s-native-validation-failure-policy`, which defaults to `Fail`, for both Gatekeeper's CEL evaluation and generated VAP resources. An explicit `source.failurePolicy` takes precedence over this default. This is separate from `validatingWebhookFailurePolicy`, which controls how Kubernetes handles failures when calling Gatekeeper's validating webhook and does not set CEL or generated VAP failure policy defaults.
+
+When the Kubernetes API server cannot resolve the Constraint resource referenced by a generated VAP's `paramKind`, `failurePolicy: Fail` rejects matching requests. Clusters that need admission to remain available during transient bootstrap or resource-discovery failures can set `--default-k8s-native-validation-failure-policy=Ignore`, or set the Helm value `defaultK8sNativeValidationFailurePolicy: Ignore`. `Ignore` allows requests affected by policy configuration or evaluation errors; validations that evaluate to `false` continue to use the VAP binding's configured validation actions.
+
+### Per-Constraint VAP generation
+
+Set `--vap-generation-mode=constraint` or Helm value `vapGenerationMode: constraint` to generate one VAP and VAPBinding for each Constraint. Gatekeeper embeds `spec.parameters` in the generated VAP, omits the VAP `spec.paramKind`, and omits the VAPBinding `spec.paramRef`. This removes the kube-apiserver startup dependency on Constraint CRD discovery and parameter informer readiness. The default `template` mode preserves the existing shared VAP topology.
+
+**Parameter visibility:** Embedded parameters are readable by any principal with `get`, `list`, or `watch` access to the generated ValidatingAdmissionPolicies, even if that principal cannot read the source Constraint kind. Owner references do not transfer the Constraint's RBAC restrictions to its VAP. Review VAP read permissions before enabling this mode, and do not put secrets, credentials, or other confidential values in Constraint parameters.
+
+**Generated expression size:** Before switching modes, verify that existing Constraints can be generated in a test cluster. Kubernetes' CEL parser limits each expression to 100,000 Unicode code points. Per-Constraint mode checks the encoded parameter expression and every specialized match condition, including fallback expressions, against that limit. Map keys, CEL syntax, and string escaping count toward the limit, so supported raw parameter and match-data sizes vary. A 100,000-character parameter string already exceeds the limit once encoded, and large namespace or kind lists can exceed it in generated match conditions. Oversized expressions are not truncated or automatically split. Shared-policy mode reads parameter and match data from the Constraint object rather than embedding it in generated CEL.
+
+Oversized generated expressions produce a generation error identifying the parameter expression or match-condition name, encoded size, and limit without including input values. Gatekeeper leaves any existing VAP and binding unchanged, so they continue enforcing the previous parameters and matching behavior. A new Constraint does not receive a generated VAP until the error is corrected; VAP-only enforcement provides no protection from that Constraint in the meantime. Reduce the parameter or match data, or keep `vapGenerationMode: template`, and verify generation status and native admission decisions before completing the migration.
+
+The Helm chart leaves `vapGenerationMode` unset by default and does not add `--vap-generation-mode` during installs or upgrades when the value is omitted. Gatekeeper uses its binary default of `template`. Explicit `template` or `constraint` values emit the flag; values retained from an existing Helm release also apply when reused during an upgrade.
+
+In `constraint` mode, the ConstraintTemplate does not create a shared VAP. When migrating from `template` mode, Gatekeeper retains the existing shared VAP only while a VAPBinding still references it, then deletes it after all bindings have moved to their per-Constraint VAPs. During rollback to `template` mode, an existing per-Constraint binding or an owned per-Constraint VAP requires Gatekeeper to verify that the shared VAP is owned by the current template and matches its current generated policy, including synchronized scope. This also applies when the binding is missing or already references the shared policy. A stale shared VAP retained from an interrupted migration does not permit rollback. Until the shared policy is current, Gatekeeper leaves any existing binding and specialized policy unchanged and retries; it does not create a missing binding to the stale policy. After a successful binding write, it cleans up the owned specialized policy. If the binding was already missing, retaining the specialized policy alone does not restore native enforcement. This verifies API object state, not simultaneous activation by all kube-apiservers.
+
+Shared-policy cleanup runs in a separate worker on generator pods, in batches of up to 100 templates. Candidate collection stops between templates after one-third of the batch's 30-second timeout, leaving time for checking references and deleting policies; an in-flight read is still bounded by the full batch timeout. Each batch shares one paginated API list when cached references cannot establish that policies are still in use. List failures leave all candidates intact; deletion failures are retried with backoff. Ownership and resource-version checks protect replaced policies. Cleanup does not block template reconciliation or run in the admission request path. The worker retries discovery and watch initialization after startup failures, and binding changes enqueue cleanup directly without relisting every Constraint. It does not reuse negative reference results between batches.
+
+Bindings without a Constraint owner also retain a shared policy while they reference it. Deleting or repointing the last such binding triggers cleanup without requiring a template update. Cleanup still verifies that the policy belongs to the current ConstraintTemplate and that no bindings reference it before deletion.
+
+The Constraint controller also retries VAPBinding watch initialization after transient discovery or cache-synchronization failures. In `constraint` mode, it retries the specialized VAP watch as well, so subsequent policy or binding changes can reconcile the owning Constraint after startup discovery recovers.
+
+Per-Constraint mode is opt-in because it creates and compiles one VAP per Constraint. Constraint parameter updates rewrite the corresponding VAP, and ConstraintTemplate updates rewrite every derived VAP. A large number of Constraints therefore increases API server storage, memory, and compilation work. While Gatekeeper is unavailable, generated VAPs continue to enforce their last reconciled parameter values.
+
+All Gatekeeper pods assigned the `generate` operation must use the same VAP generation mode. The Helm chart assigns generation to the audit Deployment by default (`audit.disableGenerateOperation: false`); controller-manager generation defaults to disabled (`controllerManager.disableGenerateOperation: true`). Setting only `controllerManager.strategyType=Recreate` does not stop the default audit generator, and separate Deployment strategies do not coordinate a handoff between multiple generators.
+
+Change modes using a two-phase rollout:
+
+1. Record the current generation assignments and identify every running pod assigned `generate`, including any custom deployments. Pause automation that could restore those assignments during the migration. Upgrade with both `audit.disableGenerateOperation=true` and `controllerManager.disableGenerateOperation=true`, without changing `vapGenerationMode`; disable any custom generators as well.
+2. Wait for the rollout to complete and verify that **all previously running generator pods have terminated**, including pods in `Terminating`. Deployment readiness alone is not proof that no old generator remains. Do not change modes or re-enable generation until this condition holds.
+3. Upgrade with the desired `vapGenerationMode` and restore the recorded generation assignments in the same upgrade. Restore custom generators only after their configuration uses that same mode. Wait for generation to converge and verify the generated policies, binding references, Constraint status, and expected admission decisions before resuming automation.
+
+For the chart's default generation assignments, the Helm upgrades are:
+
+```shell
+helm upgrade gatekeeper <chart> --namespace gatekeeper-system --reuse-values \
+  --set audit.disableGenerateOperation=true \
+  --set controllerManager.disableGenerateOperation=true --wait
+
+# Complete the generator-termination check in step 2 before this upgrade.
+helm upgrade gatekeeper <chart> --namespace gatekeeper-system --reuse-values \
+  --set vapGenerationMode=constraint \
+  --set audit.disableGenerateOperation=false \
+  --set controllerManager.disableGenerateOperation=true --wait
+```
+
+Use the same sequence with `vapGenerationMode=template` for rollback. Adjust the release name, namespace, chart, and restored assignments for the installation; the second command above restores only the chart defaults. During the generation pause, existing native policies continue enforcing their last generated configuration, but policy changes do not converge. This procedure prevents mixed-mode generator overlap; it does not provide an atomic policy-activation barrier across kube-apiservers.
+
+ConstraintTemplate CEL should access Constraint parameters through `variables.params`. Per-Constraint mode rejects templates that directly reference the VAP top-level `params` variable because generated VAPs intentionally have no `paramKind`. Locally bound CEL variables named `params` are permitted. String-map keys are preserved literally, including keys that are not valid CEL property identifiers; use string indexing for those keys.
+
+When inherited webhook rules cover only a subset of a template's requested operations, generation succeeds with the intersected operations and reports a warning. In `constraint` mode, the warning appears in the `vap.k8s.io` entry's `message` under the ConstraintPodStatus `status.enforcementPointsStatus`, and in the generator logs. It clears after a successful reconcile with matching operations.
+
+Inlined parameters are dynamically typed CEL map and list values. Schema-specific Kubernetes list-map and list-set equality or concatenation semantics from the Constraint CRD are not available in this mode.
+
+To override the `--default-create-vap-for-templates` flag's behavior for a constraint template, set `generateVAP` to `true` explicitly under the K8sNativeValidation engine's `source` in the constraint template. 
+
+```yaml
+spec:
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      code:
+        - engine: K8sNativeValidation
+          source:
+            generateVAP: true
+            ...
+```
+
+To override the `--default-create-vap-binding-for-constraints` flag's behavior for a constraint, `spec.scopedEnforcementAction` can be used. Gatekeeper determines the intended enforcement actions for a given enforcement point by evaluating what is provided in `spec.scopedEnforcementActions` and `spec.enforcementAction: scoped` in the constraint.
+
+The overall opt-in/opt-out behavior for constraint to generate Validating Admission Policy Binding (VAPB) is as below:
+
+Constraint with `enforcementAction: scoped`:
+
+| `vap.k8s.io` in constraint with `spec.scopedEnforcementActions` | generate VAPB |
+|----------|----------|
+| Not included | Do not generate VAPB |
+| Included | Generate VAPB |
+
+Constraint without `enforcementAction: scoped`:
+
+| `--default-create-vap-binding-for-constraints` | generate VAPB |
+|----------|----------|
+| false | Do not generate VAPB |
+| true | Generate VAPB |
+
+:::note
+VAPs are only generated from templates with the VAP CEL engine. VAPBindings are only generated for Constraints that belong to templates with the VAP CEL engine.
+:::
+
+:::tip
+In the event K8s Validating Admission Controller fails open, Gatekeeper admission webhook can act as a backup when included in constraint.
+:::
+
+Validating Admission Policy Binding for the below constraint will always get generated, assuming the constraint belongs to a template with VAP CEL engine.
+
+```yaml
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sAllowedRepos
+metadata:
+  name: prod-repo-is-openpolicyagent
+spec:
+...
+  enforcementAction: scoped
+  scopedEnforcementActions:
+  - action: deny
+    enforcementPoints:
+    - name: "vap.k8s.io"
+    - name: "validation.gatekeeper.sh"
+...
+```
+
+To see this in action, checkout this [demo](https://github.com/open-policy-agent/gatekeeper/tree/master/demo/scoped-enforcement-actions)
+
+Below is the mapping of Gatekeeper's `enforcementActions` to `validatingAdmissionPolicyBinding.spec.validationActions`:
+
+| `enforcementAction` | `validationActions` |
+| --- | --- |
+| `deny` | `Deny` |
+| `warn` | `Warn` |
+| `dryrun` | `Audit` |
+
+When `--emit-admission-audit-annotations=true`, Gatekeeper appends `Audit` to generated bindings that otherwise use `Deny` or `Warn`; bindings generated from `dryrun` continue to contain one `Audit` action. By default, generated policies omit the custom `evaluation` marker and retain only native failure auditing. Failed validations use Kubernetes' standard `validation.policy.admission.k8s.io/validation_failure` annotation, whose contents and aggregation are controlled by the API server rather than Gatekeeper.
+
+Set `--admission-audit-annotations-include-success=true` to also publish a custom `evaluation` marker with the value `true` when at least one binding evaluates the request. Kubernetes deduplicates the constant value across matching bindings, keeping the annotation bounded without listing matching Constraint names. This option defaults to `false` and only applies when admission audit annotations are enabled. It does not change the binding's enforcement actions or evaluate validation expressions again. The webhook follows the same setting: zero-violation annotations are omitted by default and included only when this option is enabled; deny, warn, and dryrun violations remain annotated even on allowed requests. Configure both flags on the process performing the `generate` operation and, for split deployments, on the validation webhook process as well. With Helm, use `emitAdmissionAuditAnnotations=true` for violations-only auditing and additionally set `admissionAuditAnnotationsIncludeSuccess=true` to include successful evaluations. If both enforcement points are selected, both may add entries to the same request's audit event.
+
+## Configuring VAP Operations
+
+When Gatekeeper generates a ValidatingAdmissionPolicy (VAP) from a ConstraintTemplate, the VAP's `operations` are determined by the **intersection** of:
+
+1. The operations configured on Gatekeeper's **validating webhook** (e.g., `CREATE`, `UPDATE`, and optionally `DELETE`)
+2. The `operations` specified in the ConstraintTemplate's `targets[].operations` field
+
+The `targets[].operations` field is **optional**. When omitted, the generated VAP inherits the webhook's operations directly with no intersection filtering.
+
+When `targets[].operations` is specified, it can be set in the ConstraintTemplate as follows:
+
+```yaml
+spec:
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      operations: ["CREATE", "UPDATE", "DELETE"]
+      code:
+        - engine: K8sNativeValidation
+          source:
+            ...
+```
+
+This means a ConstraintTemplate that targets `DELETE` will only produce a VAP with `DELETE` in its resource rules if the webhook is also configured to handle `DELETE` operations.
+
+### Enabling DELETE for VAP policies
+
+By default, Gatekeeper's webhook only handles `CREATE` and `UPDATE`. To use `DELETE` in a ConstraintTemplate's operations and have it reflected in the generated VAP, you must enable delete operations on the webhook.
+
+**Helm:**
+
+```yaml
+enableDeleteOperations: true
+```
+
+For other methods, see [Customizing Admission Behavior](customize-admission.md#enable-validation-of-delete-operations).
+
+:::warning
+If there is **partial overlap** between the ConstraintTemplate's operations and the webhook's operations (e.g., the CT specifies `CREATE` and `DELETE` but the webhook only has `CREATE` and `UPDATE`), the VAP is still generated using only the intersecting operations (`CREATE` in this example). A non-fatal warning is logged to indicate the mismatch.
+
+If there is **no overlap** at all (e.g., CT has only `DELETE` but the webhook only has `CREATE` and `UPDATE`), the VAP resource **will not be generated**.
+:::
+
+## FAQs
+
+<details>
+<summary>Do all engines in a ConstraintTemplate get evaluated? Is there a fallback among engines?</summary>
+Only one engine is evaluated for each ConstraintTemplate. `K8sNativeValidation` engine holds a higher priority than the `Rego` engine. There is no fallback mechanism between engines, hence a logical/syntactical error in the policy logic is treated as violation depending on the enforcement action specified in the Constraint.
+</details>
+
+<details>
+<summary>If I have a template with Rego and CEL, which policy engine will be used when evaluating resources?</summary>
+K8sNativeValidation engine holds a higher priority than the Rego engine, so with a ConstraintTemplate that has both Rego and CEL. Policy logic written in CEL will get evaluated by the K8sNativeValidation engine.
+</details>
+
+<details>
+<summary>Can I change the priority of engines per ConstraintTemplate?
+</summary>
+No, engine priority cannot be modified.
+</details>
+
+<details>
+<summary>Why does CEL use anyobject?
+</summary>
+Gatekeeper sets Object to oldObject on DELETE requests however, Kubernetes does not do this for ValidatingAdmissionPolicy. In order for evaluation in both environments to behave identically, we must be sure that Object is unset on DELETE. Hence Gatekeeper sets anyObject for users who need the "if DELETE Object == OldObject" behavior.
+</details>

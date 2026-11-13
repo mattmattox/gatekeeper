@@ -36,6 +36,205 @@ Adds additional pod labels to the common ones
 */}}
 {{- define "gatekeeper.podLabels" -}}
 {{- if .Values.podLabels }}
-{{- toYaml .Values.podLabels | nindent 8 }}
+{{- toYaml .Values.podLabels }}
 {{- end }}
+{{- end -}}
+
+{{/*
+Adds additional controller-manager pod labels to the common ones
+*/}}
+{{- define "controllerManager.podLabels" -}}
+{{- if .Values.controllerManager.podLabels }}
+{{- toYaml .Values.controllerManager.podLabels }}
+{{- end }}
+{{- end -}}
+
+{{/*
+Adds additional audit pod labels to the common ones
+*/}}
+{{- define "audit.podLabels" -}}
+{{- if .Values.audit.podLabels }}
+{{- toYaml .Values.audit.podLabels }}
+{{- end }}
+{{- end -}}
+
+
+{{/*
+Mandatory labels
+*/}}
+{{- define "gatekeeper.mandatoryLabels" -}}
+app: {{ include "gatekeeper.name" . }}
+chart: {{ include "gatekeeper.name" . }}
+gatekeeper.sh/system: "yes"
+heritage: {{ .Release.Service }}
+release: {{ .Release.Name }}
+{{- end }}
+
+{{/*
+Common labels
+*/}}
+{{- define "gatekeeper.commonLabels" -}}
+helm.sh/chart: {{ include "gatekeeper.chart" . }}
+{{ include "gatekeeper.selectorLabels" . }}
+{{- if .Chart.Version }}
+app.kubernetes.io/version: {{ .Chart.Version | replace "+" "_" | quote }}
+{{- end }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- if .Values.commonLabels }}
+{{ toYaml .Values.commonLabels }}
+{{- end }}
+{{- end }}
+
+{{/*
+Common annotations
+*/}}
+{{- define "gatekeeper.commonAnnotations" -}}
+{{- if .Values.commonAnnotations }}
+{{ toYaml .Values.commonAnnotations }}
+{{- end }}
+{{- end }}
+
+{{/*
+Selector labels
+*/}}
+{{- define "gatekeeper.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "gatekeeper.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}
+
+{{/*
+Output post install webhook probe container entry
+*/}}
+{{- define "gatekeeper.postInstallWebhookProbeContainer" -}}
+- name: webhook-probe-post
+  image: "{{ .Values.postInstall.probeWebhook.image.repository }}:{{ .Values.postInstall.probeWebhook.image.tag }}"
+  imagePullPolicy: {{ .Values.postInstall.probeWebhook.image.pullPolicy }}
+  command:
+    - "curl"
+  args:
+    - "--retry"
+    - "99999"
+    - "--retry-connrefused"
+    - "--retry-max-time"
+    - "{{ .Values.postInstall.probeWebhook.waitTimeout }}"
+    - "--retry-delay"
+    - "1"
+    - "--max-time"
+    - "{{ .Values.postInstall.probeWebhook.httpTimeout }}"
+    {{- if .Values.postInstall.probeWebhook.insecureHTTPS }}
+    - "--insecure"
+    {{- else }}
+    - "--cacert"
+    - /certs/ca.crt
+    {{- end }}
+    - "-v"
+    - "https://gatekeeper-webhook-service.{{ .Release.Namespace }}.svc/v1/admitlabel?timeout=2s"
+  resources:
+  {{- toYaml .Values.postInstall.resources | nindent 4 }}
+  securityContext:
+    {{- if .Values.enableRuntimeDefaultSeccompProfile }}
+    seccompProfile:
+      type: RuntimeDefault
+    {{- end }}
+  {{- toYaml .Values.postInstall.securityContext | nindent 4 }}
+  volumeMounts:
+  - mountPath: /certs
+    name: cert
+    readOnly: true
+{{- end -}}
+
+{{/*
+Output post install webhook probe volume entry
+*/}}
+{{- define "gatekeeper.postInstallWebhookProbeVolume" -}}
+- name: cert
+  secret:
+    secretName: {{ .Values.externalCertInjection.secretName }}
+{{- end -}}
+
+{{/*
+Extra volume mounts for audit and controller-manager pods
+*/}}
+{{- define "gatekeeper.extraVolumeMounts" -}}
+{{- if .Values.extraVolumeMounts }}
+{{- toYaml .Values.extraVolumeMounts }}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Extra volume mounts for audit and controller-manager pods
+*/}}
+{{- define "gatekeeper.extraVolumes" -}}
+{{- if .Values.extraVolumes }}
+{{- toYaml .Values.extraVolumes }}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Extra env vars for audit and controller-manager pods
+*/}}
+{{- define "gatekeeper.extraEnvs" -}}
+{{- if .Values.extraEnvs }}
+{{- toYaml .Values.extraEnvs }}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Extra env vars for controller-manager pods
+*/}}
+{{- define "controllerManager.extraEnvs" -}}
+{{- if .Values.controllerManager.extraEnvs }}
+{{- toYaml .Values.controllerManager.extraEnvs }}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Extra env vars for audit pods
+*/}}
+{{- define "audit.extraEnvs" -}}
+{{- if .Values.audit.extraEnvs }}
+{{- toYaml .Values.audit.extraEnvs }}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Mandatory namespace exemption for Gatekeeper.
+Used in the NamespaceSelector of the Gatekeeper validating and mutating webhook to ensure
+deployed namespace is exempted.
+*/}}
+{{- define "gatekeeper.mandatoryNamespaceExemption" -}}
+"kubernetes.io/metadata.name":
+  - {{ .Release.Namespace }}
+{{- end -}}
+
+{{/*
+Returns "true" for true, t or 1 and "false" for false, f or 0, in any case.
+Unset, null or "" returns the default; other values are returned unchanged.
+Usage: include "gatekeeper.exportFlag" (dict "value" .Values.enableViolationExport "default" "true")
+*/}}
+{{- define "gatekeeper.exportFlag" -}}
+{{- $value := toString .value -}}
+{{- if or (kindIs "invalid" .value) (eq $value "") -}}
+{{- .default -}}
+{{- else if has (lower $value) (list "true" "t" "1") -}}
+true
+{{- else if has (lower $value) (list "false" "f" "0") -}}
+false
+{{- else -}}
+{{- $value -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Returns "true" if the chart creates the disk Connection: the disk backend and
+either audit or admission export set to true.
+*/}}
+{{- define "gatekeeper.diskConnectionRendered" -}}
+{{- $audit := include "gatekeeper.exportFlag" (dict "value" .Values.enableViolationExport "default" "false") -}}
+{{- $admission := include "gatekeeper.exportFlag" (dict "value" .Values.enableAdmissionViolationExport "default" "false") -}}
+{{- if and (eq (.Values.exportBackend | default "" | lower) "disk") (or (eq $audit "true") (eq $admission "true")) -}}
+true
+{{- else -}}
+false
+{{- end -}}
 {{- end -}}

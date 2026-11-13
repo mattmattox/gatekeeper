@@ -17,8 +17,8 @@ package v1beta1
 
 import (
 	templatesv1beta1 "github.com/open-policy-agent/frameworks/constraint/pkg/apis/templates/v1beta1"
-	"github.com/open-policy-agent/gatekeeper/pkg/operations"
-	"github.com/open-policy-agent/gatekeeper/pkg/util"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/operations"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/util"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -26,43 +26,67 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
-// ConstraintTemplatePodStatusStatus defines the observed state of ConstraintTemplatePodStatus
+// ConstraintTemplatePodStatusStatus defines the observed state of ConstraintTemplatePodStatus.
 type ConstraintTemplatePodStatusStatus struct {
 	// Important: Run "make" to regenerate code after modifying this file
-	ID                 string                             `json:"id,omitempty"`
-	TemplateUID        types.UID                          `json:"templateUID,omitempty"`
-	Operations         []string                           `json:"operations,omitempty"`
-	ObservedGeneration int64                              `json:"observedGeneration,omitempty"`
-	Errors             []*templatesv1beta1.CreateCRDError `json:"errors,omitempty"`
+
+	// id is the name of the pod that generated this status.
+	ID string `json:"id,omitempty"`
+	// templateUID is the UID of the ConstraintTemplate this status reports on. It
+	// is used to ignore statuses that belong to a previous ConstraintTemplate with
+	// the same name, for example after it was deleted and recreated.
+	TemplateUID types.UID `json:"templateUID,omitempty"`
+	// operations lists the Gatekeeper operations assigned to the pod that generated
+	// this status.
+	Operations []string `json:"operations,omitempty"`
+	// observedGeneration is the generation of the ConstraintTemplate that was last
+	// processed by this pod.
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+	// errors lists any errors encountered while creating the CRD for the
+	// ConstraintTemplate on this pod.
+	Errors []*templatesv1beta1.CreateCRDError `json:"errors,omitempty"`
+	// vapGenerationStatus reports the status of generating a ValidatingAdmissionPolicy
+	// for the ConstraintTemplate on this pod.
+	VAPGenerationStatus *VAPGenerationStatus `json:"vapGenerationStatus,omitempty"`
+}
+
+// VAPGenerationStatus represents the status of VAP generation.
+type VAPGenerationStatus struct {
+	// state is the current state of ValidatingAdmissionPolicy generation.
+	State string `json:"state,omitempty"`
+	// observedGeneration is the generation of the ConstraintTemplate that was last
+	// processed for ValidatingAdmissionPolicy generation.
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+	// warning contains a human-readable warning encountered while generating the
+	// ValidatingAdmissionPolicy, if any.
+	Warning string `json:"warning,omitempty"`
 }
 
 // +kubebuilder:object:root=true
 // +kubebuilder:resource:scope=Namespaced
 
-// ConstraintTemplatePodStatus is the Schema for the constrainttemplatepodstatuses API
+// ConstraintTemplatePodStatus is the Schema for the constrainttemplatepodstatuses API.
 type ConstraintTemplatePodStatus struct {
-	metav1.TypeMeta   `json:",inline"`
+	metav1.TypeMeta `json:",inline"`
+	// metadata is the standard object metadata.
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
+	// status is the observed state of the ConstraintTemplate for this pod.
 	Status ConstraintTemplatePodStatusStatus `json:"status,omitempty"`
 }
 
 // +kubebuilder:object:root=true
 
-// ConstraintTemplatePodStatusList contains a list of ConstraintTemplatePodStatus
+// ConstraintTemplatePodStatusList contains a list of ConstraintTemplatePodStatus.
 type ConstraintTemplatePodStatusList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []ConstraintTemplatePodStatus `json:"items"`
 }
 
-func init() {
-	SchemeBuilder.Register(&ConstraintTemplatePodStatus{}, &ConstraintTemplatePodStatusList{})
-}
-
 // NewConstraintTemplateStatusForPod returns a constraint template status object
 // that has been initialized with the bare minimum of fields to make it functional
-// with the constraint template status controller
+// with the constraint template status controller.
 func NewConstraintTemplateStatusForPod(pod *corev1.Pod, templateName string, scheme *runtime.Scheme) (*ConstraintTemplatePodStatus, error) {
 	obj := &ConstraintTemplatePodStatus{}
 	name, err := KeyForConstraintTemplate(pod.Name, templateName)
@@ -77,16 +101,16 @@ func NewConstraintTemplateStatusForPod(pod *corev1.Pod, templateName string, sch
 		ConstraintTemplateNameLabel: templateName,
 		PodLabel:                    pod.Name,
 	})
-	if PodOwnershipEnabled() {
-		if err := controllerutil.SetOwnerReference(pod, obj, scheme); err != nil {
-			return nil, err
-		}
+
+	if err := controllerutil.SetOwnerReference(pod, obj, scheme); err != nil {
+		return nil, err
 	}
+
 	return obj, nil
 }
 
 // KeyForConstraintTemplate returns a unique status object name given the Pod ID and
-// a template object
+// a template object.
 func KeyForConstraintTemplate(id string, templateName string) (string, error) {
-	return dashPacker(id, templateName)
+	return DashPacker(id, templateName)
 }

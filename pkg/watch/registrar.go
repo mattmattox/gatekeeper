@@ -16,7 +16,9 @@ limitations under the License.
 package watch
 
 import (
+	"context"
 	"fmt"
+	"sort"
 	"sync"
 
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -48,7 +50,7 @@ func (w *vitals) merge(wv vitals) vitals {
 }
 
 // recordKeeper holds the source of truth for the intended state of the manager
-// This is essentially a read/write lock on the wrapped map (the `intent` variable)
+// This is essentially a read/write lock on the wrapped map (the `intent` variable).
 type recordKeeper struct {
 	// map[registrarName][kind]
 	intent     map[string]vitalsByGVK
@@ -83,7 +85,7 @@ func (r *recordKeeper) RemoveRegistrar(parentName string) error {
 	if registrar == nil {
 		return nil
 	}
-	if err := registrar.ReplaceWatch(nil); err != nil {
+	if err := registrar.ReplaceWatch(context.Background(), nil); err != nil {
 		return err
 	}
 
@@ -120,10 +122,17 @@ func (r *recordKeeper) ReplaceRegistrarRoster(reg *Registrar, roster map[schema.
 		if err := r.metrics.reportGvkIntentCount(int64(r.count())); err != nil {
 			log.Error(err, "while reporting gvk intent count metric")
 		}
-
 	}()
 
 	r.intent[reg.parentName] = roster
+}
+
+// Watching returns whether a GVK is being watched by a given registrar.
+func (r *recordKeeper) Watching(parentName string, gvk schema.GroupVersionKind) bool {
+	r.intentMux.RLock()
+	defer r.intentMux.RUnlock()
+	_, ok := r.intent[parentName][gvk]
+	return ok
 }
 
 // Remove removes the intent-to-watch a particular resource kind.
@@ -164,7 +173,7 @@ func (r *recordKeeper) Get() vitalsByGVK {
 	return managedKinds
 }
 
-// count returns total gvk count across all registrars
+// count returns total gvk count across all registrars.
 func (r *recordKeeper) count() int {
 	managedKinds := make(map[schema.GroupVersionKind]bool)
 	for _, registrar := range r.intent {
@@ -183,6 +192,10 @@ func (r *recordKeeper) GetGVK() []schema.GroupVersionKind {
 	for gvk := range g {
 		gvks = append(gvks, gvk)
 	}
+
+	sort.Slice(gvks, func(i, j int) bool {
+		return gvks[i].String() < gvks[j].String()
+	})
 	return gvks
 }
 
@@ -198,32 +211,38 @@ func newRecordKeeper() (*recordKeeper, error) {
 	}, nil
 }
 
-// A Registrar allows a parent to add/remove child watches
+// A Registrar allows a parent to add/remove child watches.
 type Registrar struct {
 	parentName   string
 	mgr          *Manager
 	managedKinds *recordKeeper
 	events       chan<- event.GenericEvent
+	mux          sync.RWMutex
 }
 
 // AddWatch registers a watch for the given kind.
 //
 // AddWatch will only block if all of the following are true:
-//   * The registrar is joining an existing watch
-//   * The registrar's event channel does not have sufficient capacity to receive existing resources
-//   * The consumer of the channel does not receive any unbuffered events.
+//   - The registrar is joining an existing watch
+//   - The registrar's event channel does not have sufficient capacity to receive existing resources
+//   - The consumer of the channel does not receive any unbuffered events.
+//
 // XXXX also may block if the watch manager has not been started.
-func (r *Registrar) AddWatch(gvk schema.GroupVersionKind) error {
+func (r *Registrar) AddWatch(ctx context.Context, gvk schema.GroupVersionKind) error {
+	r.mux.Lock()
+	defer r.mux.Unlock()
 	wv := vitals{
 		gvk:        gvk,
 		registrars: map[*Registrar]bool{r: true},
 	}
 	r.managedKinds.Update(r.parentName, vitalsByGVK{gvk: wv})
-	return r.mgr.addWatch(r, gvk)
+	return r.mgr.addWatch(ctx, r, gvk)
 }
 
 // ReplaceWatch replaces the set of watched resources.
-func (r *Registrar) ReplaceWatch(gvks []schema.GroupVersionKind) error {
+func (r *Registrar) ReplaceWatch(ctx context.Context, gvks []schema.GroupVersionKind) error {
+	r.mux.Lock()
+	defer r.mux.Unlock()
 	roster := make(vitalsByGVK)
 	for _, gvk := range gvks {
 		wv := vitals{
@@ -233,12 +252,26 @@ func (r *Registrar) ReplaceWatch(gvks []schema.GroupVersionKind) error {
 		roster[gvk] = wv
 	}
 	r.managedKinds.ReplaceRegistrarRoster(r, roster)
-	return r.mgr.replaceWatches(r)
+	return r.mgr.replaceWatches(ctx, r)
 }
 
 // RemoveWatch removes a watch for the given kind.
 // Ignores the request if the kind was not previously watched.
-func (r *Registrar) RemoveWatch(gvk schema.GroupVersionKind) error {
+func (r *Registrar) RemoveWatch(ctx context.Context, gvk schema.GroupVersionKind) error {
+	r.mux.Lock()
+	defer r.mux.Unlock()
 	r.managedKinds.Remove(r.parentName, gvk)
-	return r.mgr.removeWatch(r, gvk)
+	return r.mgr.removeWatch(ctx, r, gvk)
+}
+
+// IfWatching executes the passed function if the provided GVK is being watched
+// by the registrar, ignoring it if not. It returns whether the function was
+// executed and any errors returned by the executed function.
+func (r *Registrar) IfWatching(gvk schema.GroupVersionKind, fn func() error) (bool, error) {
+	r.mux.RLock()
+	defer r.mux.RUnlock()
+	if r.managedKinds.Watching(r.parentName, gvk) {
+		return true, fn()
+	}
+	return false, nil
 }

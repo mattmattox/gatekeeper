@@ -2,20 +2,18 @@ package testhelpers
 
 import (
 	"reflect"
+	"strings"
 
-	"github.com/open-policy-agent/gatekeeper/pkg/mutation/match"
-	"github.com/open-policy-agent/gatekeeper/pkg/mutation/mutators/core"
-	"github.com/open-policy-agent/gatekeeper/pkg/mutation/path/parser"
-	path "github.com/open-policy-agent/gatekeeper/pkg/mutation/path/tester"
-	"github.com/open-policy-agent/gatekeeper/pkg/mutation/types"
-	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/mutation/match"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/mutation/mutators/core"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/mutation/path/parser"
+	path "github.com/open-policy-agent/gatekeeper/v3/pkg/mutation/path/tester"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/mutation/types"
 )
 
 var _ types.Mutator = &DummyMutator{}
 
-// DummyMutator is a blank mutator that makes it easier to test the core mutation function
+// DummyMutator is a blank mutator that makes it easier to test the core mutation function.
 type DummyMutator struct {
 	name  string
 	value interface{}
@@ -35,25 +33,26 @@ func (d *DummyMutator) ID() types.ID {
 	return types.ID{Group: "mutators.gatekeeper.sh", Kind: "DummyMutator", Name: d.name}
 }
 
-func (d *DummyMutator) Value() (interface{}, error) {
-	return d.value, nil
-}
-
 func (d *DummyMutator) Path() parser.Path {
 	return d.path
 }
 
-func (d *DummyMutator) Matches(obj runtime.Object, ns *corev1.Namespace) bool {
-	matches, err := match.Matches(&d.match, obj, ns)
+func (d *DummyMutator) Matches(mutable *types.Mutable) (bool, error) {
+	m := &match.Matchable{Object: mutable.Object, Namespace: mutable.Namespace}
+	matches, err := match.Matches(&d.match, m)
 	if err != nil {
-		return false
+		return false, err
 	}
-	return matches
+	return matches, nil
 }
 
-func (d *DummyMutator) Mutate(obj *unstructured.Unstructured) (bool, error) {
+func (d *DummyMutator) Mutate(mutable *types.Mutable) (bool, error) {
 	t, _ := path.New(parser.Path{}, nil)
-	return core.Mutate(d, t, func(_ interface{}, _ bool) bool { return true }, obj)
+	return core.Mutate(d.Path(), t, core.NewDefaultSetter(d.value), mutable.Object)
+}
+
+func (d *DummyMutator) MustTerminate() bool {
+	return false
 }
 
 func (d *DummyMutator) String() string {
@@ -66,4 +65,9 @@ func NewDummyMutator(name, path string, value interface{}) *DummyMutator {
 		panic(err)
 	}
 	return &DummyMutator{name: name, path: p, value: value}
+}
+
+// BigName returns a 64-length string.
+func BigName() string {
+	return strings.Repeat("abigname", 8) // 8 X 8 = 64
 }

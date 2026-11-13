@@ -20,11 +20,10 @@ import (
 	stdlog "log"
 	"os"
 	"path/filepath"
-	"sync"
 	"testing"
 
-	"github.com/onsi/gomega"
-	"github.com/open-policy-agent/gatekeeper/apis"
+	"github.com/open-policy-agent/gatekeeper/v3/apis"
+	exportutil "github.com/open-policy-agent/gatekeeper/v3/pkg/export/util"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -32,22 +31,24 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
-	"sigs.k8s.io/controller-runtime/pkg/manager"
 )
 
 var cfg *rest.Config
 
 func TestMain(m *testing.M) {
+	// These tests register controllers without an export system.
+	*exportutil.ExportEnabled = false
 	var err error
-
 	t := &envtest.Environment{
 		CRDDirectoryPaths: []string{
 			filepath.Join("..", "..", "config", "crd", "bases"),
-			filepath.Join("..", "..", "vendor", "github.com", "open-policy-agent", "frameworks", "constraint", "deploy", "crds.yaml"),
 			filepath.Join("testdata", "crds"),
 		},
 		ErrorIfCRDPathMissing: true,
 	}
+	///TODO(ritazh): remove when vap is GAed in k/k
+	args := t.ControlPlane.GetAPIServer().Configure()
+	args.Append("runtime-config", "api/all=true")
 	if err := apis.AddToScheme(scheme.Scheme); err != nil {
 		stdlog.Fatal(err)
 	}
@@ -64,18 +65,7 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// StartTestManager adds recFn
-func StartTestManager(ctx context.Context, mgr manager.Manager, g *gomega.GomegaWithT) *sync.WaitGroup {
-	wg := &sync.WaitGroup{}
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		g.Expect(mgr.Start(ctx)).NotTo(gomega.HaveOccurred())
-	}()
-	return wg
-}
-
-// Bootstrap the gatekeeper-system namespace for use in tests
+// Bootstrap the gatekeeper-system namespace for use in tests.
 func createGatekeeperNamespace(cfg *rest.Config) error {
 	c, err := client.New(cfg, client.Options{})
 	if err != nil {

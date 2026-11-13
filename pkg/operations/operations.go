@@ -8,29 +8,37 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 )
 
 type Operation string
 
 // All defined Operations.
 const (
-	Audit          = Operation("audit")
-	Status         = Operation("status")
-	MutationStatus = Operation("mutation-status")
-	Webhook        = Operation("webhook")
+	Audit              = Operation("audit")
+	MutationController = Operation("mutation-controller")
+	MutationStatus     = Operation("mutation-status")
+	MutationWebhook    = Operation("mutation-webhook")
+	Status             = Operation("status")
+	Webhook            = Operation("webhook")
+	Generate           = Operation("generate")
 )
 
 var (
 	// allOperations is a list of all possible Operations that can be assigned to
-	// a pod. It is NOT intended to be mutated. It should be kept in alphabetical
-	// order so that it can be readily compared to the results from AssignedOperations.
+	// a pod. It is NOT intended to be mutated.
 	allOperations = []Operation{
 		Audit,
-		Status,
+		Generate,
+		MutationController,
 		MutationStatus,
+		MutationWebhook,
+		Status,
 		Webhook,
 	}
-	operations = newOperationSet()
+
+	operationsMtx sync.RWMutex
+	operations    = newOperationSet()
 )
 
 type opSet struct {
@@ -80,31 +88,69 @@ func init() {
 	flag.Var(operations, "operation", "The operation to be performed by this instance. e.g. audit, webhook. This flag can be declared more than once. Omitting will default to supporting all operations.")
 }
 
-// AssignedOperations returns a map of operations assigned to the pod
-func AssignedOperations() map[Operation]bool {
-	ret := make(map[Operation]bool)
-	for k, v := range operations.assignedOperations {
-		ret[k] = v
+// SetForTest replaces the assigned operations until the returned restore
+// function is called.
+func SetForTest(assigned ...Operation) (func(), error) {
+	replacement := newOperationSet()
+	replacement.assignedOperations = make(map[Operation]bool, len(assigned))
+	replacement.initialized = true
+	for _, op := range assigned {
+		if !replacement.validOperations[op] {
+			return nil, fmt.Errorf("operation %s is not a valid operation: %v", op, replacement.validOperations)
+		}
+		replacement.assignedOperations[op] = true
 	}
-	return ret
+
+	operationsMtx.Lock()
+	original := operations
+	operations = replacement
+	operationsMtx.Unlock()
+
+	return func() {
+		operationsMtx.Lock()
+		operations = original
+		operationsMtx.Unlock()
+	}, nil
 }
 
-// IsAssigned returns true when the provided operation is assigned to the pod
+// IsAssigned returns true when the provided operation is assigned to the pod.
 func IsAssigned(op Operation) bool {
+	operationsMtx.RLock()
+	defer operationsMtx.RUnlock()
+
 	return operations.assignedOperations[op]
 }
 
 // AssignedStringList returns a list of all operations assigned to the pod
-// as a sorted list of strings
+// as a sorted list of strings.
 func AssignedStringList() []string {
+	// Use a read lock so we can exit early without potentially having multiple
+	// threads try to write this simultaneously.
+	operationsMtx.RLock()
+	gotList := operations.assignedStringList
+	operationsMtx.RUnlock()
+	if gotList != nil {
+		return gotList
+	}
+
+	operationsMtx.Lock()
+	defer operationsMtx.Unlock()
+	// Verify the list hasn't been set since we last checked.
 	if operations.assignedStringList != nil {
 		return operations.assignedStringList
 	}
+
 	var ret []string
 	for k := range operations.assignedOperations {
 		ret = append(ret, string(k))
 	}
 	sort.Strings(ret)
+
 	operations.assignedStringList = ret
 	return operations.assignedStringList
+}
+
+// HasValidationOperations reports whether audit or validating-webhook operations are assigned.
+func HasValidationOperations() bool {
+	return IsAssigned(Audit) || IsAssigned(Webhook)
 }

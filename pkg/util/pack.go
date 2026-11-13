@@ -1,11 +1,11 @@
 package util
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
 
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -19,7 +19,7 @@ var ErrInvalidPackedName = errors.New("invalid packed name, want request.Name to
 
 // UnpackRequest unpacks the GVK from a reconcile.Request and returns the separated components.
 // GVK is encoded as "Kind.Version.Group".
-// Requests are expected to be in the format: {Name: "gvk:EncodedGVK:Name", Namespace: Namespace}
+// Requests are expected to be in the format: {Name: "gvk:EncodedGVK:Name", Namespace: Namespace}.
 func UnpackRequest(r reconcile.Request) (schema.GroupVersionKind, reconcile.Request, error) {
 	fields := strings.SplitN(r.Name, ":", 3)
 	if len(fields) != 3 || fields[0] != "gvk" {
@@ -41,7 +41,7 @@ func UnpackRequest(r reconcile.Request) (schema.GroupVersionKind, reconcile.Requ
 // EventPackerMapFunc maps an event into a reconcile.Request with embedded GVK information. Must
 // be unpacked with UnpackRequest() before use.
 func EventPackerMapFunc() handler.MapFunc {
-	return func(obj client.Object) []reconcile.Request {
+	return func(_ context.Context, obj client.Object) []reconcile.Request {
 		if obj == nil {
 			return nil
 		}
@@ -57,20 +57,8 @@ func EventPackerMapFunc() handler.MapFunc {
 				NamespacedName: types.NamespacedName{
 					Namespace: obj.GetNamespace(),
 					Name:      packed,
-				}},
+				},
+			},
 		}
-	}
-}
-
-// EventPackerMapFuncHardcodeGVK accounts for the fact that typed K8s objects have
-// no GVK associated with them by allowing the caller to set the expected GVK
-func EventPackerMapFuncHardcodeGVK(gvk schema.GroupVersionKind) handler.MapFunc {
-	mf := EventPackerMapFunc()
-	return func(obj client.Object) []reconcile.Request {
-		u := &unstructured.Unstructured{}
-		u.SetGroupVersionKind(gvk)
-		u.SetNamespace(obj.GetNamespace())
-		u.SetName(obj.GetName())
-		return mf(u)
 	}
 }

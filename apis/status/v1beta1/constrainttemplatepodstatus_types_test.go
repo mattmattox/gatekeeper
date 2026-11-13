@@ -1,47 +1,68 @@
-package v1beta1
+package v1beta1_test
 
 import (
-	"os"
 	"testing"
 
-	. "github.com/onsi/gomega"
-	"github.com/open-policy-agent/gatekeeper/pkg/operations"
+	"github.com/google/go-cmp/cmp"
+	"github.com/open-policy-agent/gatekeeper/v3/apis/status/v1beta1"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/fakes"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/operations"
+	"github.com/open-policy-agent/gatekeeper/v3/test/testutils"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
 func TestNewConstraintTemplateStatusForPod(t *testing.T) {
-	g := NewGomegaWithT(t)
 	podName := "some-gk-pod"
 	podNS := "a-gk-namespace"
 	templateName := "a-template"
-	os.Setenv("POD_NAMESPACE", podNS)
-	defer os.Unsetenv("POD_NAMESPACE")
+
+	testutils.Setenv(t, "POD_NAMESPACE", podNS)
 
 	scheme := runtime.NewScheme()
-	g.Expect(AddToScheme(scheme)).NotTo(HaveOccurred())
-	g.Expect(corev1.AddToScheme(scheme)).NotTo(HaveOccurred())
+	err := v1beta1.AddToScheme(scheme)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	pod := &corev1.Pod{}
-	pod.SetName(podName)
-	pod.SetNamespace(podNS)
+	err = corev1.AddToScheme(scheme)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	expectedStatus := &ConstraintTemplatePodStatus{}
+	pod := fakes.Pod(
+		fakes.WithNamespace(podNS),
+		fakes.WithName(podName),
+	)
+
+	expectedStatus := &v1beta1.ConstraintTemplatePodStatus{}
 	expectedStatus.SetName("some--gk--pod-a--template")
 	expectedStatus.SetNamespace(podNS)
 	expectedStatus.Status.ID = podName
 	expectedStatus.Status.Operations = operations.AssignedStringList()
 	expectedStatus.SetLabels(map[string]string{
-		ConstraintTemplateNameLabel: templateName,
-		PodLabel:                    podName,
+		v1beta1.ConstraintTemplateNameLabel: templateName,
+		v1beta1.PodLabel:                    podName,
 	})
-	g.Expect(controllerutil.SetOwnerReference(pod, expectedStatus, scheme)).NotTo(HaveOccurred())
 
-	status, err := NewConstraintTemplateStatusForPod(pod, templateName, scheme)
-	g.Expect(err).NotTo(HaveOccurred())
-	g.Expect(status).To(Equal(expectedStatus))
-	n, err := KeyForConstraintTemplate(podName, templateName)
-	g.Expect(err).NotTo(HaveOccurred())
-	g.Expect(status.Name).To(Equal(n))
+	err = controllerutil.SetOwnerReference(pod, expectedStatus, scheme)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	status, err := v1beta1.NewConstraintTemplateStatusForPod(pod, templateName, scheme)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff := cmp.Diff(expectedStatus, status); diff != "" {
+		t.Fatal(diff)
+	}
+	n, err := v1beta1.KeyForConstraintTemplate(podName, templateName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Name != n {
+		t.Fatal("got status.Name != n, want equal")
+	}
 }

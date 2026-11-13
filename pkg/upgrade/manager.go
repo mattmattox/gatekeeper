@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/open-policy-agent/gatekeeper/pkg/util"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/util"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -28,23 +28,21 @@ const (
 	crdName = "constrainttemplates.templates.gatekeeper.sh"
 )
 
-// Manager allows us to upgrade resources on startup
+// Manager allows us to upgrade resources on startup.
 type Manager struct {
 	client client.Client
 	mgr    manager.Manager
-	ctx    context.Context
 }
 
-// New creates a new manager for audit
-func New(ctx context.Context, mgr manager.Manager) (*Manager, error) {
+// New creates a new manager for audit.
+func New(mgr manager.Manager) *Manager {
 	am := &Manager{
 		mgr: mgr,
-		ctx: ctx,
 	}
-	return am, nil
+	return am
 }
 
-// Start implements the Runnable interface
+// Start implements the Runnable interface.
 func (um *Manager) Start(ctx context.Context) error {
 	log.Info("Starting Upgrade Manager")
 	defer log.Info("Stopping upgrade manager workers")
@@ -80,6 +78,8 @@ func (um *Manager) upgrade(ctx context.Context) error {
 	gvs := []string{
 		"constraints.gatekeeper.sh/v1alpha1",
 		"templates.gatekeeper.sh/v1alpha1",
+		"mutations.gatekeeper.sh/v1alpha1",
+		"externaldata.gatekeeper.sh/v1alpha1",
 	}
 	for _, gv := range gvs {
 		if err := um.upgradeGroupVersion(ctx, gv); err != nil {
@@ -89,7 +89,7 @@ func (um *Manager) upgrade(ctx context.Context) error {
 	return nil
 }
 
-// upgradeGroupVersion touches each resource in a given groupVersion, incrementing its storage version
+// upgradeGroupVersion touches each resource in a given groupVersion, incrementing its storage version.
 func (um *Manager) upgradeGroupVersion(ctx context.Context, groupVersion string) error {
 	// new client to get updated restmapper
 	c, err := client.New(um.mgr.GetConfig(), client.Options{Scheme: um.mgr.GetScheme(), Mapper: nil})
@@ -136,7 +136,7 @@ func (um *Manager) upgradeGroupVersion(ctx context.Context, groupVersion string)
 			return err
 		}
 		log.Info("resource count", "count", len(instanceList.Items))
-		updateResources := make(map[util.KindVersionResource]unstructured.Unstructured, len(instanceList.Items))
+		updateResources := make(map[util.KindVersionName]unstructured.Unstructured, len(instanceList.Items))
 		// get each resource
 		for _, item := range instanceList.Items {
 			key := util.GetUniqueKey(item)
@@ -151,20 +151,20 @@ func (um *Manager) upgradeGroupVersion(ctx context.Context, groupVersion string)
 				stopped: make(chan struct{}),
 			}
 			log.Info("starting update resources loop", "group", group, "version", version, "kind", kind)
-			go urloop.update()
+			go urloop.update(ctx)
 		}
 	}
 	return nil
 }
 
 type updateResourceLoop struct {
-	ur      map[util.KindVersionResource]unstructured.Unstructured
+	ur      map[util.KindVersionName]unstructured.Unstructured
 	client  client.Client
 	stop    chan struct{}
 	stopped chan struct{}
 }
 
-func (urloop *updateResourceLoop) update() {
+func (urloop *updateResourceLoop) update(ctx context.Context) {
 	defer close(urloop.stopped)
 	updateLoop := func() (bool, error) {
 		for _, item := range urloop.ur {
@@ -173,7 +173,6 @@ func (urloop *updateResourceLoop) update() {
 				return true, nil
 			default:
 				failure := false
-				ctx := context.Background()
 				var latestItem unstructured.Unstructured
 				item.DeepCopyInto(&latestItem)
 				name := latestItem.GetName()

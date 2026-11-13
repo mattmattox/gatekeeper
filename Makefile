@@ -1,39 +1,111 @@
 # Image URL to use all building/pushing image targets
 REPOSITORY ?= openpolicyagent/gatekeeper
+CRD_REPOSITORY ?= openpolicyagent/gatekeeper-crds
+GATOR_REPOSITORY ?= openpolicyagent/gator
+
+GHCR_REPOSITORY ?= ghcr.io/open-policy-agent/gatekeeper
+GHCR_CRD_REPOSITORY ?= ghcr.io/open-policy-agent/gatekeeper-crds
+GHCR_GATOR_REPOSITORY ?= ghcr.io/open-policy-agent/gator
+GHCR_FAKE_READER_REPOSITORY ?= ghcr.io/open-policy-agent/fake-reader
 
 IMG := $(REPOSITORY):latest
+CRD_IMG := $(CRD_REPOSITORY):latest
+GATOR_IMG := $(GATOR_REPOSITORY):latest
+PUSH_TO_GHCR ?= false
 # DEV_TAG will be replaced with short Git SHA on pre-release stage in CI
 DEV_TAG ?= dev
 USE_LOCAL_IMG ?= false
+ENABLE_GENERATOR_EXPANSION ?= false
+ENABLE_EXPORT ?=
+ENABLE_ADMISSION_EXPORT ?= false
+EMIT_ADMISSION_AUDIT_ANNOTATIONS ?= false
+ADMISSION_AUDIT_ANNOTATIONS_INCLUDE_SUCCESS ?= false
+AUDIT_CONNECTION ?= "audit"
+AUDIT_CHANNEL ?= "audit"
+LOG_LEVEL ?= "INFO"
+GENERATE_VAP ?= true
+GENERATE_VAPBINDING ?= true
+SYNC_VAP_ENFORCEMENT_SCOPE ?= true
 
-VERSION := v3.6.0-beta.2
+VERSION := v3.24.0-beta.0
 
-KIND_VERSION ?= 0.11.0
+KIND_VERSION ?= 0.33.0
+KIND_CLUSTER_FILE ?= ""
 # note: k8s version pinned since KIND image availability lags k8s releases
-KUBERNETES_VERSION ?= 1.21.1
-KUSTOMIZE_VERSION ?= 3.8.8
-BATS_VERSION ?= 1.2.1
-BATS_TESTS_FILE ?= test/bats/test.bats
-KUBECTL_KUSTOMIZE_VERSION ?= 1.20.1-${KUSTOMIZE_VERSION}
-HELM_VERSION ?= 3.4.2
+KUBERNETES_VERSION ?= 1.37.0
+# envtest pinned to 1.33: unit tests use v1beta1 VAP APIs.
+ENVTEST_KUBERNETES_VERSION ?= 1.33.0
+KUSTOMIZE_VERSION ?= 5.8.1
+BATS_VERSION ?= 1.14.0
+ORAS_VERSION ?= 1.3.4
+# Run all suites locally; CI selects separate files for the core and VAP-scope matrices.
+BATS_TESTS_FILE ?= test/bats/test.bats test/bats/vap_scope.bats
+HELM_VERSION ?= 4.2.3
+NODE_VERSION ?= 24-bullseye-slim
+YQ_VERSION ?= 4.53.3
+
 HELM_ARGS ?=
+HELM_TIMEOUT ?= 5m
+
+HELM_DISK_SHARED_EXPORT_ARGS = --set audit.exportVolumeMount.path=${EXPORT_DISK_MOUNT} \
+	--set audit.exportConnection.path=${EXPORT_DISK_PATH} \
+	--set audit.exportConnection.maxAuditResults=${MAX_AUDIT_RESULTS} \
+
+HELM_DISK_AUDIT_EXPORT_ARGS = \
+	--set audit.exportSidecar.image=${FAKE_READER_IMAGE} \
+	--set audit.exportSidecar.imagePullPolicy=${FAKE_READER_IMAGE_PULL_POLICY} \
+
+HELM_DISK_ADMISSION_EXPORT_ARGS = --set admission.disableExportSidecar=false \
+	--set admission.exportSidecar.image=${FAKE_READER_IMAGE} \
+	--set admission.exportSidecar.imagePullPolicy=${FAKE_READER_IMAGE_PULL_POLICY} \
+
+HELM_EXPORT_ARGS := $(if $(ENABLE_EXPORT),--set enableViolationExport=${ENABLE_EXPORT}) \
+	--set audit.connection=${AUDIT_CONNECTION} \
+	--set audit.channel=${AUDIT_CHANNEL} \
+	--set enableAdmissionViolationExport=${ENABLE_ADMISSION_EXPORT} \
+	--set exportBackend=${EXPORT_BACKEND} \
+
+HELM_EXTRA_ARGS := --set image.repository=${HELM_REPO} \
+	--set image.crdRepository=${HELM_CRD_REPO} \
+	--set image.release=${HELM_RELEASE} \
+	--set postInstall.labelNamespace.image.repository=${HELM_CRD_REPO} \
+	--set postInstall.labelNamespace.image.tag=${HELM_RELEASE} \
+	--set postInstall.labelNamespace.enabled=true \
+	--set postInstall.probeWebhook.enabled=true \
+	--set emitAdmissionEvents=true \
+	--set emitAdmissionAuditAnnotations=${EMIT_ADMISSION_AUDIT_ANNOTATIONS} \
+	--set admissionAuditAnnotationsIncludeSuccess=${ADMISSION_AUDIT_ANNOTATIONS_INCLUDE_SUCCESS} \
+	--set emitAuditEvents=true \
+	--set admissionEventsInvolvedNamespace=true \
+	--set auditEventsInvolvedNamespace=true \
+	--set disabledBuiltins={http.send} \
+	--set logMutations=true \
+	--set logLevel=${LOG_LEVEL} \
+	--set defaultCreateVAPForTemplates=${GENERATE_VAP} \
+	--set defaultCreateVAPBindingForConstraints=${GENERATE_VAPBINDING} \
+	--set syncVAPEnforcementScope=${SYNC_VAP_ENFORCEMENT_SCOPE} \
+	--set mutationAnnotations=true;\
+
 GATEKEEPER_NAMESPACE ?= gatekeeper-system
 
 # When updating this, make sure to update the corresponding action in
 # workflow.yaml
-GOLANGCI_LINT_VERSION := v1.40.1
+GOLANGCI_LINT_VERSION := v2.9.0
 
 # Detects the location of the user golangci-lint cache.
 GOLANGCI_LINT_CACHE := $(shell pwd)/.tmp/golangci-lint
 
-BUILD_COMMIT := $(shell ./build/get-build-commit.sh)
-BUILD_TIMESTAMP := $(shell ./build/get-build-timestamp.sh)
-BUILD_HOSTNAME := $(shell ./build/get-build-hostname.sh)
+BENCHMARK_FILE_NAME ?= benchmarks.txt
+FAKE_READER_IMAGE ?= fake-reader:latest
+FAKE_READER_IMAGE_PULL_POLICY ?= IfNotPresent
 
-LDFLAGS := "-X github.com/open-policy-agent/gatekeeper/pkg/version.Version=$(VERSION) \
-	-X github.com/open-policy-agent/gatekeeper/pkg/version.Vcs=$(BUILD_COMMIT) \
-	-X github.com/open-policy-agent/gatekeeper/pkg/version.Timestamp=$(BUILD_TIMESTAMP) \
-	-X github.com/open-policy-agent/gatekeeper/pkg/version.Hostname=$(BUILD_HOSTNAME)"
+ROOT_DIR := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
+BIN_DIR := $(abspath $(ROOT_DIR)/bin)
+
+LDFLAGS := "-X github.com/open-policy-agent/gatekeeper/v3/pkg/version.Version=$(VERSION)"
+
+PLATFORM ?= linux/amd64
+OUTPUT_TYPE ?= type=docker
 
 MANAGER_IMAGE_PATCH := "apiVersion: apps/v1\
 \nkind: Deployment\
@@ -50,9 +122,16 @@ MANAGER_IMAGE_PATCH := "apiVersion: apps/v1\
 \n        - --port=8443\
 \n        - --logtostderr\
 \n        - --emit-admission-events\
+\n        - --emit-admission-audit-annotations=${EMIT_ADMISSION_AUDIT_ANNOTATIONS}\
+\n        - --admission-audit-annotations-include-success=${ADMISSION_AUDIT_ANNOTATIONS_INCLUDE_SUCCESS}\
+\n        - --admission-events-involved-namespace\
 \n        - --exempt-namespace=${GATEKEEPER_NAMESPACE}\
 \n        - --operation=webhook\
+\n        - --operation=mutation-webhook\
 \n        - --disable-opa-builtin=http.send\
+\n        - --log-mutations\
+\n        - --mutation-annotations\
+\n        - --log-level=${LOG_LEVEL}\
 \n---\
 \napiVersion: apps/v1\
 \nkind: Deployment\
@@ -67,12 +146,43 @@ MANAGER_IMAGE_PATCH := "apiVersion: apps/v1\
 \n        name: manager\
 \n        args:\
 \n        - --emit-audit-events\
+\n        - --emit-admission-audit-annotations=${EMIT_ADMISSION_AUDIT_ANNOTATIONS}\
+\n        - --admission-audit-annotations-include-success=${ADMISSION_AUDIT_ANNOTATIONS_INCLUDE_SUCCESS}\
+\n        - --audit-events-involved-namespace\
 \n        - --operation=audit\
 \n        - --operation=status\
-\n        - --logtostderr"
+\n        - --operation=mutation-status\
+\n        - --operation=generate\
+\n        - --audit-chunk-size=500\
+\n        - --logtostderr\
+\n        - --default-create-vap-for-templates=${GENERATE_VAP}\
+\n        - --default-create-vap-binding-for-constraints=${GENERATE_VAPBINDING}\
+\n        - --sync-vap-enforcement-scope=${SYNC_VAP_ENFORCEMENT_SCOPE}\
+\n        - --log-level=${LOG_LEVEL}\
+\n"
 
-
-FRAMEWORK_PACKAGE := github.com/open-policy-agent/frameworks/constraint
+HELM_EXPORT_VARIABLES := "audit:\
+\n  exportVolume:\
+\n    name: tmp-violations\
+\n    emptyDir: {}\
+\n  exportSidecar:\
+\n    name: go-sub\
+\n    image: ${FAKE_READER_IMAGE}\
+\n    imagePullPolicy: ${FAKE_READER_IMAGE_PULL_POLICY}\
+\n    securityContext:\
+\n      allowPrivilegeEscalation: false\
+\n      capabilities:\
+\n        drop:\
+\n        - ALL\
+\n      readOnlyRootFilesystem: true\
+\n      runAsGroup: 999\
+\n      runAsNonRoot: true\
+\n      runAsUser: 1000\
+\n      seccompProfile:\
+\n        type: RuntimeDefault\
+\n    volumeMounts:\
+\n    - mountPath: /tmp/violations\
+\n      name: tmp-violations"
 
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
@@ -81,44 +191,115 @@ else
 GOBIN=$(shell go env GOBIN)
 endif
 
+ifdef GENERATE_ATTESTATIONS
+_ATTESTATIONS := --attest type=sbom --attest type=provenance,mode=max
+endif
+
 all: lint test manager
 
-# Run tests
-native-test:
-	GO111MODULE=on go test -mod vendor ./pkg/... ./apis/... -coverprofile cover.out
+# Run tests with coverage
+.PHONY: native-test
+native-test: envtest
+	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_KUBERNETES_VERSION) --bin-dir $(LOCALBIN) -p path)" \
+	GO111MODULE=on \
+	go test . ./pkg/... ./apis/... ./cmd/gator/... -coverprofile cover.out
+
+# Run tests with race detector
+.PHONY: native-race-test
+native-race-test: envtest
+	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_KUBERNETES_VERSION) --bin-dir $(LOCALBIN) -p path)" \
+	GO111MODULE=on \
+	go test . ./pkg/... ./apis/... ./cmd/gator/... -race -timeout 20m
+
+# Run benchmarks only (no unit tests)
+.PHONY: native-bench-test
+native-bench-test: envtest
+	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_KUBERNETES_VERSION) --bin-dir $(LOCALBIN) -p path)" \
+	GO111MODULE=on \
+	go test ./pkg/... ./apis/... ./cmd/gator/... -bench . -run "^$$"
+
+.PHONY: benchmark-test
+benchmark-test:
+	GOMAXPROCS=1 go test ./pkg/... -bench . -run="^#" -count 10 > ${BENCHMARK_FILE_NAME}
 
 # Hook to run docker tests
 .PHONY: test
-test:
-	rm -rf .staging/test
-	mkdir -p .staging/test
-	cp -r * .staging/test
-	-rm .staging/test/Dockerfile
-	cp test/Dockerfile .staging/test/Dockerfile
-	docker build --pull .staging/test -t gatekeeper-test && docker run -t gatekeeper-test
+test: __test-image
+	docker run --rm -t -v $(shell pwd):/app \
+		gatekeeper-test make native-test
 
+.PHONY: test-e2e
 test-e2e:
-	bats -t ${BATS_TESTS_FILE}
+	bats -t test/bats/helpers_test.bats ${BATS_TESTS_FILE}
 
-KIND_NODE_VERSION := kindest/node:v$(KUBERNETES_VERSION)
-e2e-bootstrap:
+test-e2e-owner-ref:
+	@bash test/with-admission-plugin/test-e2e-owner-ref.sh
+
+.PHONY: test-gator
+test-gator: gator test-gator-verify test-gator-test test-gator-expand test-gator-policy
+
+.PHONY: test-gator-containerized
+test-gator-containerized: __test-image
+	docker run --privileged -v $(shell pwd):/app -v /var/lib/docker \
+	gatekeeper-test ./test/image/gator-test.sh
+
+.PHONY: test-gator-verify
+test-gator-verify: gator
+	./bin/gator verify test/gator/verify/suite.yaml
+
+.PHONY: test-gator-test
+test-gator-test: gator
+	bats test/gator/test
+
+.PHONY: test-gator-expand
+test-gator-expand: gator
+	bats test/gator/expand
+
+.PHONY: test-gator-policy
+test-gator-policy: gator
+	go test -cover -race ./pkg/gator/policy/...
+
+.PHONY: test-gator-policy-e2e
+test-gator-policy-e2e: gator
+	bats test/gator/policy/policy.bats
+
+e2e-dependencies:
 	# Download and install kind
 	curl -L https://github.com/kubernetes-sigs/kind/releases/download/v${KIND_VERSION}/kind-linux-amd64 --output ${GITHUB_WORKSPACE}/bin/kind && chmod +x ${GITHUB_WORKSPACE}/bin/kind
 	# Download and install kubectl
-	curl -L https://storage.googleapis.com/kubernetes-release/release/v${KUBERNETES_VERSION}/bin/linux/amd64/kubectl -o ${GITHUB_WORKSPACE}/bin/kubectl && chmod +x ${GITHUB_WORKSPACE}/bin/kubectl
+	curl -L https://dl.k8s.io/release/v${KUBERNETES_VERSION}/bin/linux/amd64/kubectl -o ${GITHUB_WORKSPACE}/bin/kubectl && chmod +x ${GITHUB_WORKSPACE}/bin/kubectl
 	# Download and install kustomize
 	curl -L https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_linux_amd64.tar.gz -o kustomize_v${KUSTOMIZE_VERSION}_linux_amd64.tar.gz && tar -zxvf kustomize_v${KUSTOMIZE_VERSION}_linux_amd64.tar.gz && chmod +x kustomize && mv kustomize ${GITHUB_WORKSPACE}/bin/kustomize
 	# Download and install bats
 	curl -sSLO https://github.com/bats-core/bats-core/archive/v${BATS_VERSION}.tar.gz && tar -zxvf v${BATS_VERSION}.tar.gz && bash bats-core-${BATS_VERSION}/install.sh ${GITHUB_WORKSPACE}
+	# Install yq
+	curl -L https://github.com/mikefarah/yq/releases/download/v$(YQ_VERSION)/yq_linux_amd64 -o ${GITHUB_WORKSPACE}/bin/yq && chmod +x ${GITHUB_WORKSPACE}/bin/yq
+
+KIND_NODE_VERSION := kindest/node:v$(KUBERNETES_VERSION)
+e2e-bootstrap: e2e-dependencies
 	# Check for existing kind cluster
 	if [ $$(${GITHUB_WORKSPACE}/bin/kind get clusters) ]; then ${GITHUB_WORKSPACE}/bin/kind delete cluster; fi
+
 	# Create a new kind cluster
-	TERM=dumb ${GITHUB_WORKSPACE}/bin/kind create cluster --image $(KIND_NODE_VERSION) --wait 5m
+	if [ ! -f $(KIND_CLUSTER_FILE) ]; then \
+		${GITHUB_WORKSPACE}/bin/kind create cluster --image $(KIND_NODE_VERSION) --wait 5m; \
+	else \
+		${GITHUB_WORKSPACE}/bin/kind create cluster --config $(KIND_CLUSTER_FILE) --image $(KIND_NODE_VERSION) --wait 5m; \
+	fi
 
-e2e-build-load-image: docker-buildx
-	kind load docker-image --name kind ${IMG}
+e2e-build-load-image: docker-buildx e2e-build-load-externaldata-image
+	kind load docker-image --name kind ${IMG} ${CRD_IMG}
 
-e2e-verify-release: patch-image deploy test-e2e
+e2e-build-load-externaldata-image: docker-buildx-builder
+	./test/externaldata/dummy-provider/scripts/generate-tls-certificate.sh
+	docker buildx build \
+		--platform="$(PLATFORM)" \
+		--output=$(OUTPUT_TYPE) \
+		-t dummy-provider:test \
+		-f test/externaldata/dummy-provider/Dockerfile test/externaldata/dummy-provider
+	kind load docker-image --name kind dummy-provider:test
+
+e2e-verify-release: e2e-build-load-externaldata-image patch-image deploy test-e2e
 	echo -e '\n\n======= manager logs =======\n\n' && kubectl logs -n ${GATEKEEPER_NAMESPACE} -l control-plane=controller-manager
 
 e2e-helm-install:
@@ -126,19 +307,25 @@ e2e-helm-install:
 	mkdir -p .staging/helm
 	curl https://get.helm.sh/helm-v${HELM_VERSION}-linux-amd64.tar.gz > .staging/helm/helmbin.tar.gz
 	cd .staging/helm && tar -xvf helmbin.tar.gz
-	./.staging/helm/linux-amd64/helm version --client
+	./.staging/helm/linux-amd64/helm version
 
-e2e-helm-deploy: e2e-helm-install
+e2e-helm-deploy: e2e-helm-install $(LOCALBIN)
+ifneq ($(filter true,$(ENABLE_EXPORT) $(ENABLE_ADMISSION_EXPORT)),)
+	./.staging/helm/linux-amd64/helm install manifest_staging/charts/gatekeeper --name-template=gatekeeper \
+		--namespace ${GATEKEEPER_NAMESPACE} \
+		--debug --wait --timeout ${HELM_TIMEOUT} \
+		$(HELM_EXPORT_ARGS) \
+		$(if $(and $(filter true,$(ENABLE_EXPORT) $(ENABLE_ADMISSION_EXPORT)),$(filter disk,$(EXPORT_BACKEND))),$(HELM_DISK_SHARED_EXPORT_ARGS)) \
+		$(if $(and $(filter true,$(ENABLE_EXPORT)),$(filter disk,$(EXPORT_BACKEND))),$(HELM_DISK_AUDIT_EXPORT_ARGS)) \
+		$(if $(and $(filter true,$(ENABLE_ADMISSION_EXPORT)),$(filter disk,$(EXPORT_BACKEND))),$(HELM_DISK_ADMISSION_EXPORT_ARGS)) \
+		$(HELM_EXTRA_ARGS)
+else
 	./.staging/helm/linux-amd64/helm install manifest_staging/charts/gatekeeper --name-template=gatekeeper \
 		--namespace ${GATEKEEPER_NAMESPACE} --create-namespace \
-		--debug --wait \
-		--set image.repository=${HELM_REPO} \
-		--set image.release=${HELM_RELEASE} \
-		--set emitAdmissionEvents=true \
-		--set emitAuditEvents=true \
-		--set postInstall.labelNamespace.enabled=true \
-		--set experimentalEnableMutation=true \
-		--set disabledBuiltins={http.send};\
+		--debug --wait --timeout ${HELM_TIMEOUT} \
+		$(if $(ENABLE_EXPORT),--set enableViolationExport=${ENABLE_EXPORT}) \
+		$(HELM_EXTRA_ARGS)
+endif
 
 e2e-helm-upgrade-init: e2e-helm-install
 	./.staging/helm/linux-amd64/helm repo add gatekeeper https://open-policy-agent.github.io/gatekeeper/charts;\
@@ -147,45 +334,54 @@ e2e-helm-upgrade-init: e2e-helm-install
 		--debug --wait \
 		--set emitAdmissionEvents=true \
 		--set emitAuditEvents=true \
+		--set admissionEventsInvolvedNamespace=true \
+		--set auditEventsInvolvedNamespace=true \
 		--set postInstall.labelNamespace.enabled=true \
-		--set disabledBuiltins={http.send};\
+		--set postInstall.probeWebhook.enabled=true \
+		--set disabledBuiltins={http.send} \
+		--set enableExternalData=true \
+		--set logMutations=true \
+		--set logLevel=${LOG_LEVEL} \
+		--set mutationAnnotations=true;\
 
 e2e-helm-upgrade:
 	./helm_migrate.sh
 	./.staging/helm/linux-amd64/helm upgrade gatekeeper manifest_staging/charts/gatekeeper \
 		--namespace ${GATEKEEPER_NAMESPACE} \
 		--debug --wait \
-		--set image.repository=${HELM_REPO} \
-		--set image.release=${HELM_RELEASE} \
-		--set emitAdmissionEvents=true \
-		--set emitAuditEvents=true \
-		--set postInstall.labelNamespace.enabled=true \
-		--set disabledBuiltins={http.send};\
+		$(HELM_EXTRA_ARGS)
+
+e2e-reader-build-image:
+	docker buildx build --platform="$(PLATFORM)" -t ${FAKE_READER_IMAGE} --load -f test/export/fake-reader/Dockerfile test/export/fake-reader
 
 # Build manager binary
 manager: generate
-	GO111MODULE=on go build -mod vendor -o bin/manager -ldflags $(LDFLAGS) main.go
+	GO111MODULE=on go build -o bin/manager -ldflags $(LDFLAGS)
 
 # Build manager binary
 manager-osx: generate
-	GO111MODULE=on go build -mod vendor -o bin/manager GOOS=darwin -ldflags $(LDFLAGS) main.go
+	GO111MODULE=on go build -o bin/manager GOOS=darwin -ldflags $(LDFLAGS)
 
 # Run against the configured Kubernetes cluster in ~/.kube/config
 run: generate manifests
-	GO111MODULE=on go run -mod vendor ./main.go
+	GO111MODULE=on go run ./main.go
 
 # Install CRDs into a cluster
 install: manifests
-	kustomize build config/crd | kubectl apply -f -
-
-deploy-mutation: patch-image
-	@grep -q -v 'enable-mutation' ./config/overlays/dev_mutation/manager_image_patch.yaml && sed -i '/- --operation=webhook/a \ \ \ \ \ \ \ \ - --enable-mutation=true' ./config/overlays/dev_mutation/manager_image_patch.yaml && sed -i '/- --operation=status/a \ \ \ \ \ \ \ \ - --operation=mutation-status' ./config/overlays/dev_mutation/manager_image_patch.yaml
-	kustomize build config/overlays/dev_mutation | kubectl apply -f -
-	kustomize build --load_restrictor LoadRestrictionsNone config/overlays/mutation | kubectl apply -f -
+	docker run -v $(shell pwd)/config:/config \
+		registry.k8s.io/kustomize/kustomize:v${KUSTOMIZE_VERSION} build \
+		/config/crd | kubectl apply -f -
 
 # Deploy controller in the configured Kubernetes cluster in ~/.kube/config
 deploy: patch-image manifests
-	kustomize build config/overlays/dev | kubectl apply -f -
+ifeq ($(ENABLE_GENERATOR_EXPANSION),true)
+	@grep -q -v 'enable-generator-resource-expansion' ./config/overlays/dev/manager_image_patch.yaml && sed -i '/- --operation=webhook/a \ \ \ \ \ \ \ \ - --enable-generator-resource-expansion=true' ./config/overlays/dev/manager_image_patch.yaml
+	@grep -q -v 'enable-generator-resource-expansion' ./config/overlays/dev/manager_image_patch.yaml && sed -i '/- --operation=audit/a \ \ \ \ \ \ \ \ - --enable-generator-resource-expansion=true' ./config/overlays/dev/manager_image_patch.yaml
+endif
+	docker run \
+		-v $(shell pwd)/config:/config \
+		registry.k8s.io/kustomize/kustomize:v${KUSTOMIZE_VERSION} build \
+		/config/overlays/dev | kubectl apply -f -
 
 # Generate manifests e.g. CRD, RBAC etc.
 manifests: __controller-gen
@@ -196,133 +392,270 @@ manifests: __controller-gen
 		paths="./apis/..." \
 		paths="./pkg/..." \
 		output:crd:artifacts:config=config/crd/bases
-	# As mutation CRDs are not ready to be included in our final gatekeeper.yaml, we leave them out of config/crd/kustomization.yaml.
-	# This makes these files unavailable to the helmify step below.  The solve for this was to copy the mutation CRDs into
-	# config/overlays/mutation_webhook/.  To maintain the generation pipeline, we do that copy step here.
-	cp config/crd/bases/*mutat* config/overlays/mutation_webhook/
+	@# Copy constraint template CRD from frameworks module
+	go mod download github.com/open-policy-agent/frameworks/constraint
+	cp $$(go list -mod=mod -m -f '{{.Dir}}' github.com/open-policy-agent/frameworks/constraint)/deploy/crds.yaml config/crd/bases/constrainttemplate-customresourcedefinition.yaml
+	./build/update-match-schema.sh
 	rm -rf manifest_staging
 	mkdir -p manifest_staging/deploy
 	mkdir -p manifest_staging/charts/gatekeeper
-	docker run --rm -v $(shell pwd):/gatekeeper --entrypoint /usr/local/bin/kustomize line/kubectl-kustomize:${KUBECTL_KUSTOMIZE_VERSION} build /gatekeeper/config/default -o /gatekeeper/manifest_staging/deploy/gatekeeper.yaml
-	docker run --rm -v $(shell pwd):/gatekeeper --entrypoint /usr/local/bin/kustomize line/kubectl-kustomize:${KUBECTL_KUSTOMIZE_VERSION} build /gatekeeper/cmd/build/helmify | go run cmd/build/helmify/*.go
+	docker run --rm -v $(shell pwd):/gatekeeper \
+		registry.k8s.io/kustomize/kustomize:v${KUSTOMIZE_VERSION} build \
+		/gatekeeper/config/default -o /gatekeeper/manifest_staging/deploy/gatekeeper.yaml
+	docker run --rm -v $(shell pwd):/gatekeeper \
+		registry.k8s.io/kustomize/kustomize:v${KUSTOMIZE_VERSION} build \
+		--load-restrictor LoadRestrictionsNone /gatekeeper/cmd/build/helmify | go run cmd/build/helmify/*.go
 
 # lint runs a dockerized golangci-lint, and should give consistent results
 # across systems.
 # Source: https://golangci-lint.run/usage/install/#docker
 lint:
-	docker run --rm -v $(shell pwd):/app \
-	 -v ${GOLANGCI_LINT_CACHE}:/root/.cache/golangci-lint \
-	 -w /app golangci/golangci-lint:${GOLANGCI_LINT_VERSION}-alpine \
-	 golangci-lint run -v
+	docker run -t --rm -v $(shell pwd):/app \
+		-v ${GOLANGCI_LINT_CACHE}:/root/.cache/golangci-lint \
+		-w /app golangci/golangci-lint:${GOLANGCI_LINT_VERSION} \
+		golangci-lint run -v --fix --concurrency 2
+
+# lint-kube-api builds a golangci-lint binary with the kube-api-linter module
+# (https://github.com/kubernetes-sigs/kube-api-linter) plugged in, and runs it
+# against the API type definitions in ./apis, checking them against
+# Kubernetes API conventions. Requires a local Go toolchain; unlike `lint`
+# this isn't dockerized because the module plugin build needs `go` and `git`
+# on the host. The golangci-lint version comes from GOLANGCI_LINT_VERSION (it
+# is deliberately not set in .custom-gcl.yml, so pass --version if you run
+# `golangci-lint custom` by hand).
+.PHONY: lint-kube-api
+lint-kube-api:
+	GOBIN=$(shell pwd)/bin go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@${GOLANGCI_LINT_VERSION}
+	./bin/golangci-lint custom --version ${GOLANGCI_LINT_VERSION}
+	./bin/golangci-lint-kube-api-linter run -c .golangci-kube-api-linter.yaml --fix ./apis/...
 
 # Generate code
-generate: __controller-gen target-template-source
+generate: __conversion-gen __controller-gen
 	$(CONTROLLER_GEN) object:headerFile=./hack/boilerplate.go.txt paths="./apis/..." paths="./pkg/..."
+	$(CONVERSION_GEN) \
+		--output-base=/gatekeeper \
+		--input-dirs=./apis/mutations/v1,./apis/mutations/v1beta1,./apis/mutations/v1alpha1,./apis/expansion/v1alpha1,./apis/syncset/v1alpha1,./apis/gvkmanifest/v1alpha1 \
+		--go-header-file=./hack/boilerplate.go.txt \
+		--output-file-base=zz_generated.conversion
+
+# Prepare crds to be added to gatekeeper-crds image
+clean-crds:
+	rm -rf .staging/crds/*
+
+build-crds: clean-crds
+	mkdir -p .staging/crds
+ifdef CI
+	cp -R manifest_staging/charts/gatekeeper/crds/ .staging/crds/
+else
+	cp -R charts/gatekeeper/crds/ .staging/crds/
+endif
 
 # Docker Login
 docker-login:
 	@docker login -u $(DOCKER_USER) -p $(DOCKER_PASSWORD) $(REGISTRY)
 
-# Tag for Dev
-docker-tag-dev:
-	@docker tag $(IMG) $(REPOSITORY):$(DEV_TAG)
-	@docker tag $(IMG) $(REPOSITORY):dev
+docker-build: docker-buildx
 
-# Tag for Dev
-docker-tag-release:
-	@docker tag $(IMG) $(REPOSITORY):$(VERSION)
+docker-buildx-builder:
+	if ! docker buildx ls | grep -q container-builder; then\
+		docker buildx create --name container-builder --use --bootstrap;\
+		docker buildx inspect;\
+	fi
 
-# Push for Dev
-docker-push-dev: docker-tag-dev
-	@docker push $(REPOSITORY):$(DEV_TAG)
-	@docker push $(REPOSITORY):dev
-
-# Push for Release
-docker-push-release: docker-tag-release
-	@docker push $(REPOSITORY):$(VERSION)
-
-docker-build:
-	docker build --pull . --build-arg LDFLAGS=${LDFLAGS} -t ${IMG}
-
-# Build docker image with buildx
-# Experimental docker feature to build cross platform multi-architecture docker images
+# Build image with buildx to build cross platform multi-architecture docker images
 # https://docs.docker.com/buildx/working-with-buildx/
-docker-buildx:
-	if ! DOCKER_CLI_EXPERIMENTAL=enabled docker buildx ls | grep -q container-builder; then\
-		DOCKER_CLI_EXPERIMENTAL=enabled docker buildx create --name container-builder --use;\
-	fi
-	DOCKER_CLI_EXPERIMENTAL=enabled docker buildx build --build-arg LDFLAGS=${LDFLAGS} --platform "linux/amd64" \
-		-t $(IMG) \
-		. --load
+docker-buildx: docker-buildx-builder
+	docker buildx build \
+		$(_ATTESTATIONS) \
+		--build-arg LDFLAGS=${LDFLAGS} \
+		--platform="$(PLATFORM)" \
+		--output=$(OUTPUT_TYPE) \
+		-t $(IMG) .
 
-docker-buildx-dev:
-	@if ! DOCKER_CLI_EXPERIMENTAL=enabled docker buildx ls | grep -q container-builder; then\
-		DOCKER_CLI_EXPERIMENTAL=enabled docker buildx create --name container-builder --use;\
-	fi
-	DOCKER_CLI_EXPERIMENTAL=enabled docker buildx build --build-arg LDFLAGS=${LDFLAGS} --platform "linux/amd64,linux/arm64,linux/arm/v7" \
+docker-buildx-crds: build-crds docker-buildx-builder
+	docker buildx build \
+		$(_ATTESTATIONS) \
+		--build-arg LDFLAGS=${LDFLAGS} \
+		--platform="$(PLATFORM)" \
+		--output=$(OUTPUT_TYPE) \
+		-t $(CRD_IMG) \
+		-f crd.Dockerfile .staging/crds/
+
+docker-buildx-dev: docker-buildx-builder
+	docker buildx build \
+		$(_ATTESTATIONS) \
+		--build-arg LDFLAGS=${LDFLAGS} \
+		--platform="$(PLATFORM)" \
+		--output=$(OUTPUT_TYPE) \
 		-t $(REPOSITORY):$(DEV_TAG) \
 		-t $(REPOSITORY):dev \
-		. --push
+		$(if $(filter true,$(PUSH_TO_GHCR)),-t $(GHCR_REPOSITORY):$(DEV_TAG)) \
+		$(if $(filter true,$(PUSH_TO_GHCR)),-t $(GHCR_REPOSITORY):dev) .
 
-docker-buildx-release:
-	@if ! DOCKER_CLI_EXPERIMENTAL=enabled docker buildx ls | grep -q container-builder; then\
-		DOCKER_CLI_EXPERIMENTAL=enabled docker buildx create --name container-builder --use;\
-	fi
-	DOCKER_CLI_EXPERIMENTAL=enabled docker buildx build --build-arg LDFLAGS=${LDFLAGS} --platform "linux/amd64,linux/arm64,linux/arm/v7" \
+docker-buildx-release: docker-buildx-builder
+	docker buildx build \
+		$(_ATTESTATIONS) \
+		--build-arg LDFLAGS=${LDFLAGS} \
+		--platform="$(PLATFORM)" \
+		--output=$(OUTPUT_TYPE) \
 		-t $(REPOSITORY):$(VERSION) \
-		. --push
+		$(if $(filter true,$(PUSH_TO_GHCR)),-t $(GHCR_REPOSITORY):$(VERSION)) .
+
+docker-buildx-crds-dev: build-crds docker-buildx-builder
+	docker buildx build \
+		$(_ATTESTATIONS) \
+		--build-arg LDFLAGS=${LDFLAGS} \
+		--platform="$(PLATFORM)" \
+		--output=$(OUTPUT_TYPE) \
+		-t $(CRD_REPOSITORY):$(DEV_TAG) \
+		-t $(CRD_REPOSITORY):dev \
+		$(if $(filter true,$(PUSH_TO_GHCR)),-t $(GHCR_CRD_REPOSITORY):$(DEV_TAG)) \
+		$(if $(filter true,$(PUSH_TO_GHCR)),-t $(GHCR_CRD_REPOSITORY):dev) \
+		-f crd.Dockerfile .staging/crds/
+
+docker-buildx-crds-release: build-crds docker-buildx-builder
+	docker buildx build \
+		$(_ATTESTATIONS) \
+		--build-arg LDFLAGS=${LDFLAGS}\
+		--platform="$(PLATFORM)" \
+		--output=$(OUTPUT_TYPE) \
+		-t $(CRD_REPOSITORY):$(VERSION) \
+		$(if $(filter true,$(PUSH_TO_GHCR)),-t $(GHCR_CRD_REPOSITORY):$(VERSION)) \
+		-f crd.Dockerfile .staging/crds/
+
+# Build gator image
+docker-buildx-gator-dev: docker-buildx-builder
+	docker buildx build \
+		$(_ATTESTATIONS) \
+		--build-arg LDFLAGS=${LDFLAGS} \
+		--platform="$(PLATFORM)" \
+		--output=$(OUTPUT_TYPE) \
+		-t ${GATOR_REPOSITORY}:${DEV_TAG} \
+		-t ${GATOR_REPOSITORY}:dev \
+		$(if $(filter true,$(PUSH_TO_GHCR)),-t ${GHCR_GATOR_REPOSITORY}:${DEV_TAG}) \
+		$(if $(filter true,$(PUSH_TO_GHCR)),-t ${GHCR_GATOR_REPOSITORY}:dev) \
+		-f gator.Dockerfile .
+
+docker-buildx-gator-release: docker-buildx-builder
+	docker buildx build \
+		$(_ATTESTATIONS) \
+		--build-arg LDFLAGS=${LDFLAGS} \
+		--platform="$(PLATFORM)" \
+		--output=$(OUTPUT_TYPE) \
+		-t ${GATOR_REPOSITORY}:${VERSION} \
+		$(if $(filter true,$(PUSH_TO_GHCR)),-t ${GHCR_GATOR_REPOSITORY}:${VERSION}) \
+		-f gator.Dockerfile .
+
+# Build fake-reader image
+docker-buildx-fake-reader: docker-buildx-builder
+	docker buildx build \
+		$(_ATTESTATIONS) \
+		--platform="$(PLATFORM)" \
+		--output=$(OUTPUT_TYPE) \
+		-t ${GHCR_FAKE_READER_REPOSITORY}:latest \
+		-f test/export/fake-reader/Dockerfile test/export/fake-reader
 
 # Update manager_image_patch.yaml with image tag
 patch-image:
 	@echo "updating kustomize image patch file for manager resource"
 	@bash -c 'echo -e ${MANAGER_IMAGE_PATCH} > ./config/overlays/dev/manager_image_patch.yaml'
-	cp ./config/overlays/dev/manager_image_patch.yaml ./config/overlays/dev_mutation/manager_image_patch.yaml
 ifeq ($(USE_LOCAL_IMG),true)
 	@sed -i '/^        name: manager/a \ \ \ \ \ \ \ \ imagePullPolicy: IfNotPresent' ./config/overlays/dev/manager_image_patch.yaml
-	@sed -i '/^        name: manager/a \ \ \ \ \ \ \ \ imagePullPolicy: IfNotPresent' ./config/overlays/dev_mutation/manager_image_patch.yaml
 endif
 	@sed -i'' -e 's@image: .*@image: '"${IMG}"'@' ./config/overlays/dev/manager_image_patch.yaml
-	@sed -i'' -e 's@image: .*@image: '"${IMG}"'@' ./config/overlays/dev_mutation/manager_image_patch.yaml
-
-# Rebuild pkg/target/target_template_source.go to pull in pkg/target/regolib/src.rego
-target-template-source:
-	@printf "package target\n\n// This file is generated from pkg/target/regolib/src.rego via \"make target-template-source\"\n// Do not modify this file directly!\n\nconst templSrc = \`" > pkg/target/target_template_source.go
-	@sed -e "s/data\[\"{{.DataRoot}}\"\]/{{.DataRoot}}/; s/data\[\"{{.ConstraintsRoot}}\"\]/{{.ConstraintsRoot}}/" pkg/target/regolib/src.rego >> pkg/target/target_template_source.go
-	@printf "\`\n" >> pkg/target/target_template_source.go
-
-# Push the docker image
-docker-push:
-	docker push ${IMG}
 
 release-manifest:
-	@sed -i -e 's/^VERSION := .*/VERSION := ${NEWVERSION}/' ./Makefile
-	@sed -i'' -e 's@image: $(REPOSITORY):.*@image: $(REPOSITORY):'"$(NEWVERSION)"'@' ./config/manager/manager.yaml
-	@sed -i "s/appVersion: .*/appVersion: ${NEWVERSION}/" ./cmd/build/helmify/static/Chart.yaml
-	@sed -i "s/version: .*/version: $$(echo ${NEWVERSION} | cut -c2-)/" ./cmd/build/helmify/static/Chart.yaml
-	@sed -i "s/release: .*/release: ${NEWVERSION}/" ./cmd/build/helmify/static/values.yaml
-	@sed -i 's/Current release version: `.*`/Current release version: `'"${NEWVERSION}"'`/' ./cmd/build/helmify/static/README.md
+	@sed -i'' -e 's@image: $(REPOSITORY):$(VERSION)@image: $(REPOSITORY):'"$(NEWVERSION)"'@' ./config/manager/manager.yaml
+	@sed -i "s/appVersion: $(VERSION)/appVersion: ${NEWVERSION}/" ./cmd/build/helmify/static/Chart.yaml
+	@sed -i "s/version: $$(echo ${VERSION} | cut -c2-)/version: $$(echo ${NEWVERSION} | cut -c2-)/" ./cmd/build/helmify/static/Chart.yaml
+	@sed -i "s/release: $(VERSION)/release: ${NEWVERSION}/" ./cmd/build/helmify/static/values.yaml
+	@sed -i "s/tag: $(VERSION)/tag: ${NEWVERSION}/" ./cmd/build/helmify/static/values.yaml
+	@sed -i 's/Current release version: `$(VERSION)`/Current release version: `'"${NEWVERSION}"'`/' ./cmd/build/helmify/static/README.md
+	@sed -i -e 's/^VERSION := $(VERSION)/VERSION := ${NEWVERSION}/' ./Makefile
 	export
 	$(MAKE) manifests
 
+# Tags a new version for docs
+.PHONY: version-docs
+version-docs:
+	@sed -i '10,$$c ${OPA_VERSIONS}' ./website/docs/opa-versions.md
+	docker run \
+		-v $(shell pwd)/website:/website \
+		-w /website \
+		-u $(shell id -u):$(shell id -g) \
+		node:${NODE_VERSION} \
+		sh -c "yarn install --frozen-lockfile && yarn run docusaurus docs:version ${NEWVERSION}"
+	@sed -i 's/https:\/\/raw\.githubusercontent\.com\/open-policy-agent\/gatekeeper\/master\/deploy\/gatekeeper\.yaml.*/https:\/\/raw\.githubusercontent\.com\/open-policy-agent\/gatekeeper\/${TAG}\/deploy\/gatekeeper\.yaml/' ./website/versioned_docs/version-${NEWVERSION}/install.md
+
+.PHONY: patch-version-docs
+patch-version-docs:
+	@sed -i 's/https:\/\/raw\.githubusercontent\.com\/open-policy-agent\/gatekeeper\/${OLDVERSION}\/deploy\/gatekeeper\.yaml.*/https:\/\/raw\.githubusercontent\.com\/open-policy-agent\/gatekeeper\/${TAG}\/deploy\/gatekeeper\.yaml/' ./website/versioned_docs/version-${NEWVERSION}/install.md
+	@sed -i '10,$$c ${OPA_VERSIONS}' ./website/docs/opa-versions.md
+	@sed -i '10,$$c ${OPA_VERSIONS}' ./website/versioned_docs/version-${NEWVERSION}/opa-versions.md
+
 promote-staging-manifest:
-	@rm -f deploy/gatekeeper.yaml
+	@rm -rf deploy
 	@cp -r manifest_staging/deploy .
 	@rm -rf charts
 	@cp -r manifest_staging/charts .
 
 # Delete gatekeeper from a cluster. Note this is not a complete uninstall, just a dev convenience
 uninstall:
-	kustomize build config/overlays/dev | kubectl delete -f -
+	docker run -v $(shell pwd)/config:/config \
+		registry.k8s.io/kustomize/kustomize:v${KUSTOMIZE_VERSION} build \
+		/config/overlays/dev | kubectl delete -f -
 
 __controller-gen: __tooling-image
-CONTROLLER_GEN=docker run -v $(shell pwd):/gatekeeper gatekeeper-tooling controller-gen
+CONTROLLER_GEN=docker run --rm -v $(shell pwd):/gatekeeper gatekeeper-tooling controller-gen
+
+__conversion-gen: __tooling-image
+CONVERSION_GEN=docker run --rm -v $(shell pwd):/gatekeeper gatekeeper-tooling conversion-gen
 
 __tooling-image:
-	docker build . \
-		-t gatekeeper-tooling \
-		-f build/tooling/Dockerfile
+	docker buildx build build/tooling \
+		--platform="$(PLATFORM)" \
+		--output=$(OUTPUT_TYPE) \
+		-t gatekeeper-tooling
 
-.PHONY: vendor
-vendor:
-	go mod vendor
-	go mod tidy
+__test-image:
+	docker buildx build test/image \
+		--platform="$(PLATFORM)" \
+		--output=$(OUTPUT_TYPE) \
+		--build-arg YQ_VERSION=$(YQ_VERSION) \
+		--build-arg BATS_VERSION=$(BATS_VERSION) \
+		--build-arg ORAS_VERSION=$(ORAS_VERSION) \
+		--build-arg KUSTOMIZE_VERSION=$(KUSTOMIZE_VERSION) \
+		-t gatekeeper-test
+
+## Location to install dependencies to
+LOCALBIN ?= $(shell pwd)/.tmp/bin
+$(LOCALBIN):
+	mkdir -p $(LOCALBIN)
+
+ENVTEST ?= $(LOCALBIN)/setup-envtest
+
+.PHONY: envtest
+envtest: $(ENVTEST) ## Download envtest-setup locally if necessary.
+$(ENVTEST): $(LOCALBIN)
+	test -s $(LOCALBIN)/setup-envtest || GOBIN=$(LOCALBIN) go install sigs.k8s.io/controller-runtime/tools/setup-envtest@v0.0.0-20250729155826-ada80794ea8f
+
+.PHONY: gator
+gator: bin/gator-$(GOOS)-$(GOARCH)
+	mv bin/gator-$(GOOS)-$(GOARCH) bin/gator
+
+bin/gator-$(GOOS)-$(GOARCH):
+	GOOS=$(GOOS) GOARCH=$(GOARCH) CGO_ENABLED=0 GO111MODULE=on go build -o $(BIN_DIR)/gator-$(GOOS)-$(GOARCH) -ldflags $(LDFLAGS) ./cmd/gator
+
+tilt-prepare:
+	mkdir -p .tiltbuild/charts
+	rm -rf .tiltbuild/charts/gatekeeper
+	cp -R manifest_staging/charts/gatekeeper .tiltbuild/charts
+	# disable some configs from the security context so we can perform live update
+	sed -i -e "/readOnlyRootFilesystem: true/d" .tiltbuild/charts/gatekeeper/values.yaml
+	sed -i -e "/run.*: .*/d" .tiltbuild/charts/gatekeeper/values.yaml
+
+tilt: generate manifests tilt-prepare
+	tilt up
+
+tilt-clean:
+	rm -rf .tiltbuild

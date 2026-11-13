@@ -1,7 +1,8 @@
+---
+{{- if .Values.rbac.create }}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  creationTimestamp: null
   labels:
     app: '{{ template "gatekeeper.name" . }}'
     chart: '{{ template "gatekeeper.name" . }}'
@@ -30,3 +31,7 @@ rules:
   - patch
   - update
   - watch
+{{- with .Values.controllerManager.extraRules }}
+  {{- toYaml . | nindent 0 }}
+{{- end }}
+{{- end }}

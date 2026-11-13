@@ -1,0 +1,39 @@
+name: release-sample-images
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions: read-all
+
+jobs:
+  publish-sample-images:
+    name: "Publish Sample Images"
+    runs-on: oracle-vm-8cpu-32gb-x86-64
+    permissions:
+      contents: read
+      packages: write
+    if: startsWith(github.ref, 'refs/tags/v') && github.repository == 'open-policy-agent/gatekeeper'
+    timeout-minutes: 30
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: audit
+
+      - name: Check out code into the Go module directory
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish fake-reader image
+        run: |
+          make docker-buildx-fake-reader \
+            PLATFORM="linux/amd64,linux/arm64" \
+            OUTPUT_TYPE=type=registry \
+            GENERATE_ATTESTATIONS=true

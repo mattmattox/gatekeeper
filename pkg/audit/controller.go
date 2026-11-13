@@ -15,18 +15,30 @@ package audit
 import (
 	"context"
 
-	opa "github.com/open-policy-agent/frameworks/constraint/pkg/client"
-	"github.com/open-policy-agent/gatekeeper/pkg/controller/config/process"
+	constraintclient "github.com/open-policy-agent/frameworks/constraint/pkg/client"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/controller/config/process"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/expansion"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/export"
+	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 )
 
-// AddToManager adds audit manager to the Manager
-func AddToManager(m manager.Manager, opa *opa.Client, processExcluder *process.Excluder) error {
+type Dependencies struct {
+	Client          *constraintclient.Client
+	ProcessExcluder *process.Excluder
+	CacheLister     *CacheLister
+	ExpansionSystem *expansion.System
+	ExportSystem    *export.System
+	GetPod          func(context.Context) (*corev1.Pod, error)
+}
+
+// AddToManager adds audit manager to the Manager.
+func AddToManager(m manager.Manager, deps *Dependencies) error {
 	if *auditInterval == 0 {
 		log.Info("auditing is disabled")
 		return nil
 	}
-	am, err := New(context.Background(), m, opa, processExcluder)
+	am, err := New(m, deps)
 	if err != nil {
 		return err
 	}

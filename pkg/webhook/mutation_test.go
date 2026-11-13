@@ -5,33 +5,41 @@ import (
 	"reflect"
 	"testing"
 
-	configv1alpha1 "github.com/open-policy-agent/gatekeeper/apis/config/v1alpha1"
-	mutationsv1alpha1 "github.com/open-policy-agent/gatekeeper/apis/mutations/v1alpha1"
-	"github.com/open-policy-agent/gatekeeper/pkg/controller/config/process"
-	"github.com/open-policy-agent/gatekeeper/pkg/mutation"
-	"github.com/open-policy-agent/gatekeeper/pkg/mutation/match"
-	"github.com/open-policy-agent/gatekeeper/pkg/mutation/mutators"
+	"github.com/open-policy-agent/cert-controller/pkg/rotator"
+	configv1alpha1 "github.com/open-policy-agent/gatekeeper/v3/apis/config/v1alpha1"
+	mutationsunversioned "github.com/open-policy-agent/gatekeeper/v3/apis/mutations/unversioned"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/controller/config/process"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/mutation"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/mutation/match"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/mutation/mutators"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/mutation/mutators/assign"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/mutation/mutators/assignmeta"
+	"github.com/open-policy-agent/gatekeeper/v3/pkg/mutation/types"
+	"github.com/stretchr/testify/require"
 	admissionv1 "k8s.io/api/admission/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
-	atypes "sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
 
-func TestWebhookAssign(t *testing.T) {
-	sys := mutation.NewSystem()
+func makeValue(v interface{}) mutationsunversioned.AssignField {
+	return mutationsunversioned.AssignField{Value: &types.Anything{Value: v}}
+}
 
-	v := &mutationsv1alpha1.Assign{
+func TestWebhookAssign(t *testing.T) {
+	sys := mutation.NewSystem(mutation.SystemOpts{})
+
+	v := &mutationsunversioned.Assign{
 		ObjectMeta: metav1.ObjectMeta{Name: "AddFoo"},
-		Spec: mutationsv1alpha1.AssignSpec{
-			ApplyTo:  []match.ApplyTo{{Groups: []string{""}, Versions: []string{"v1"}, Kinds: []string{"Pod"}}},
+		Spec: mutationsunversioned.AssignSpec{
+			ApplyTo:  []match.MutationApplyTo{{ApplyTo: match.ApplyTo{Groups: []string{""}, Versions: []string{"v1"}, Kinds: []string{"Pod"}}}},
 			Location: "spec.value",
-			Parameters: mutationsv1alpha1.Parameters{
-				Assign: runtime.RawExtension{Raw: []byte(`{"value": "foo"}`)},
+			Parameters: mutationsunversioned.Parameters{
+				Assign: makeValue("foo"),
 			},
 		},
 	}
-	if err := mutators.IsValidAssign(v); err != nil {
+	if err := assign.IsValidAssign(v); err != nil {
 		t.Fatal(err)
 	}
 
@@ -58,11 +66,12 @@ func TestWebhookAssign(t *testing.T) {
 		},
 		mutationSystem: sys,
 		deserializer:   codecs.UniversalDeserializer(),
+		log:            log,
 	}
 
 	raw := []byte(`{"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "acbd","namespace": "ns1"}}`)
 
-	req := atypes.Request{
+	req := admission.Request{
 		AdmissionRequest: admissionv1.AdmissionRequest{
 			Kind: metav1.GroupVersionKind{
 				Group:   "",
@@ -86,18 +95,18 @@ func TestWebhookAssign(t *testing.T) {
 }
 
 func TestWebhookAssignMetadata(t *testing.T) {
-	sys := mutation.NewSystem()
+	sys := mutation.NewSystem(mutation.SystemOpts{})
 
-	v := &mutationsv1alpha1.AssignMetadata{
+	v := &mutationsunversioned.AssignMetadata{
 		ObjectMeta: metav1.ObjectMeta{Name: "AddFoo"},
-		Spec: mutationsv1alpha1.AssignMetadataSpec{
+		Spec: mutationsunversioned.AssignMetadataSpec{
 			Location: "metadata.labels.foo",
-			Parameters: mutationsv1alpha1.MetadataParameters{
-				Assign: runtime.RawExtension{Raw: []byte(`{"value": "bar"}`)},
+			Parameters: mutationsunversioned.MetadataParameters{
+				Assign: makeValue("bar"),
 			},
 		},
 	}
-	if err := mutators.IsValidAssignMetadata(v); err != nil {
+	if err := assignmeta.IsValidAssignMetadata(v); err != nil {
 		t.Fatal(err)
 	}
 
@@ -124,11 +133,12 @@ func TestWebhookAssignMetadata(t *testing.T) {
 		},
 		mutationSystem: sys,
 		deserializer:   codecs.UniversalDeserializer(),
+		log:            log,
 	}
 
 	raw := []byte(`{"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "acbd","namespace": "ns1"}}`)
 
-	req := atypes.Request{
+	req := admission.Request{
 		AdmissionRequest: admissionv1.AdmissionRequest{
 			Kind: metav1.GroupVersionKind{
 				Group:   "",
@@ -148,5 +158,73 @@ func TestWebhookAssignMetadata(t *testing.T) {
 
 	if !reflect.DeepEqual(resp, expected) {
 		t.Errorf("unexpected response: %+v\n\nexpected: %+v", resp, expected)
+	}
+}
+
+func TestAppendMutationWebhookIfEnabled(t *testing.T) {
+	tests := []struct {
+		name               string
+		mwhName            string
+		additionalMwhNames string
+		input              []rotator.WebhookInfo
+		expectedWebhooks   []rotator.WebhookInfo
+	}{
+		{
+			name:               "adding to empty list",
+			mwhName:            "test-mutation-webhook",
+			additionalMwhNames: "additional-mutation-webhook-1,additional-mutation-webhook-2",
+			input:              []rotator.WebhookInfo{},
+			expectedWebhooks: []rotator.WebhookInfo{
+				{Name: "test-mutation-webhook", Type: rotator.Mutating},
+				{Name: "additional-mutation-webhook-1", Type: rotator.Mutating},
+				{Name: "additional-mutation-webhook-2", Type: rotator.Mutating},
+			},
+		},
+		{
+			name:               "adding only one webhook",
+			mwhName:            "test-mutation-webhook",
+			additionalMwhNames: "",
+			input:              []rotator.WebhookInfo{},
+			expectedWebhooks: []rotator.WebhookInfo{
+				{Name: "test-mutation-webhook", Type: rotator.Mutating},
+			},
+		},
+		{
+			name:               "adding to existing webhooks",
+			mwhName:            "test-mutation-webhook",
+			additionalMwhNames: "additional-mutation-webhook-1,additional-mutation-webhook-2",
+			input: []rotator.WebhookInfo{
+				{Name: "existing-webhook"},
+			},
+			expectedWebhooks: []rotator.WebhookInfo{
+				{Name: "existing-webhook"},
+				{Name: "test-mutation-webhook", Type: rotator.Mutating},
+				{Name: "additional-mutation-webhook-1", Type: rotator.Mutating},
+				{Name: "additional-mutation-webhook-2", Type: rotator.Mutating},
+			},
+		},
+		{
+			name:               "deduplicate mwhName and additionalMwhNames",
+			mwhName:            "test-mutation-webhook",
+			additionalMwhNames: "test-mutation-webhook,additional-mutation-webhook-1,additional-mutation-webhook-2",
+			input: []rotator.WebhookInfo{
+				{Name: "existing-webhook"},
+			},
+			expectedWebhooks: []rotator.WebhookInfo{
+				{Name: "existing-webhook"},
+				{Name: "test-mutation-webhook", Type: rotator.Mutating},
+				{Name: "additional-mutation-webhook-1", Type: rotator.Mutating},
+				{Name: "additional-mutation-webhook-2", Type: rotator.Mutating},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			MwhName = &tt.mwhName
+			AdditionalMwhNamesToRotateCerts = &tt.additionalMwhNames
+			actualWebhooks := AppendMutationWebhookIfEnabled(tt.input)
+			require.Equal(t, tt.expectedWebhooks, actualWebhooks)
+		})
 	}
 }
